@@ -2278,27 +2278,45 @@ class _PlayerPageState extends State<PlayerPage>
                     style: const TextStyle(color: Colors.white70, fontSize: 12),
                   ),
                   Expanded(
-                    child: SliderTheme(
-                      data: SliderTheme.of(context).copyWith(
-                        trackHeight: 3,
-                        thumbShape: const RoundSliderThumbShape(
-                          enabledThumbRadius: 6,
+                    // 进度条右键一次点选即生效：开头 5 分钟内取片头、结尾 5 分钟内取片尾。
+                    child: LayoutBuilder(
+                      builder: (_, constraints) => Listener(
+                        onPointerDown: (event) {
+                          if (event.kind != PointerDeviceKind.mouse) return;
+                          if ((event.buttons & kSecondaryMouseButton) == 0) {
+                            return;
+                          }
+                          unawaited(
+                            _pickSkipFromProgress(
+                              width: constraints.maxWidth,
+                              localDx: event.localPosition.dx,
+                            ),
+                          );
+                        },
+                        child: SliderTheme(
+                          data: SliderTheme.of(context).copyWith(
+                            trackHeight: 3,
+                            thumbShape: const RoundSliderThumbShape(
+                              enabledThumbRadius: 6,
+                            ),
+                            overlayShape: const RoundSliderOverlayShape(
+                              overlayRadius: 12,
+                            ),
+                            activeTrackColor: Colors.white,
+                            inactiveTrackColor: Colors.white24,
+                            thumbColor: Colors.white,
+                          ),
+                          child: Slider(
+                            value: value,
+                            max: total.toDouble(),
+                            onChanged: (v) => setState(
+                              () =>
+                                  _position = Duration(milliseconds: v.round()),
+                            ),
+                            onChangeEnd: (v) =>
+                                _seekTo(Duration(milliseconds: v.round())),
+                          ),
                         ),
-                        overlayShape: const RoundSliderOverlayShape(
-                          overlayRadius: 12,
-                        ),
-                        activeTrackColor: Colors.white,
-                        inactiveTrackColor: Colors.white24,
-                        thumbColor: Colors.white,
-                      ),
-                      child: Slider(
-                        value: value,
-                        max: total.toDouble(),
-                        onChanged: (v) => setState(
-                          () => _position = Duration(milliseconds: v.round()),
-                        ),
-                        onChangeEnd: (v) =>
-                            _seekTo(Duration(milliseconds: v.round())),
                       ),
                     ),
                   ),
@@ -3318,6 +3336,82 @@ class _PlayerPageState extends State<PlayerPage>
     }
   }
 
+  /// 进度条右键：直接按点击位置选取片头 / 片尾，不再弹二次菜单。
+  ///
+  /// 用区间来区分两种设置，避免互相踩：开头 5 分钟内 = 片头，结尾 5 分钟内 =
+  /// 片尾；不足 10 分钟的短片按前后各一半切分；中间区域只提示、不写入。
+  /// 片头 = 起播直接跳到的绝对秒数；片尾 = 距结尾还剩多少秒开始跳下一集，
+  /// 与「跳过片头 / 片尾」弹窗里的语义一致，选完立即落盘并对本资源全部剧集生效。
+  Future<void> _pickSkipFromProgress({
+    required double width,
+    required double localDx,
+  }) async {
+    if (_live) return;
+    final total = _duration.inMilliseconds;
+    if (total <= 0) return;
+    // Slider 的可见轨道两端各内缩 overlay 半径（上面 SliderTheme 设为 12），
+    // 换算前先扣掉这段，点击位置才不会整体偏早。
+    const inset = 12.0;
+    final usable = width - inset * 2 > 1 ? width - inset * 2 : 1.0;
+    final ratio = ((localDx - inset) / usable).clamp(0.0, 1.0);
+    final picked = Duration(milliseconds: (ratio * total).round());
+    final remaining = picked >= _duration ? Duration.zero : _duration - picked;
+
+    const window = Duration(minutes: 5);
+    final bool asIntro;
+    if (_duration <= window * 2) {
+      // 短片没有 5 分钟窗口可言：按中点分前后，一次右键照样能选到。
+      asIntro = picked <= _duration ~/ 2;
+    } else if (picked <= window) {
+      asIntro = true;
+    } else if (remaining <= window) {
+      asIntro = false;
+    } else {
+      _toast('右键取片头 / 片尾：请在开头 5 分钟或结尾 5 分钟内点击');
+      return;
+    }
+
+    if (asIntro) {
+      final intro = clampSkipSeconds(picked.inSeconds);
+      if (intro <= 0) {
+        _toast('这个位置等于 0 秒，片头无需跳过');
+        return;
+      }
+      await _saveSkipSegments(intro, _skipOutro);
+      if (!mounted) return;
+      _toast('片头已设为 ${_fmt(picked)}（本资源所有剧集）');
+      if (_position.inSeconds < intro) _seekTo(Duration(seconds: intro));
+      return;
+    }
+    final outro = clampSkipSeconds(remaining.inSeconds);
+    // 片尾秒数 ≤1 时本就不会触发跳集（见 shouldSkipOutro），别写个死值进去。
+    if (outro <= 1) {
+      _toast('离结尾太近，请点在更靠前的位置');
+      return;
+    }
+    await _saveSkipSegments(_skipIntro, outro);
+    if (!mounted) return;
+    _toast('片尾已设为 剩 ${_fmt(remaining)}（本资源所有剧集）');
+  }
+
+  /// 落盘片头 / 片尾秒数：本资源所有剧集共用一份，并同步播放器内的跳过状态。
+  Future<void> _saveSkipSegments(int intro, int outro) async {
+    await _app.saveSkipSegment(
+      resource: '${_detail.sourceKey}|${_detail.id}',
+      episode: _episodeKey(_index),
+      intro: intro,
+      outro: outro,
+      label: _episodeName.isEmpty ? '第${_index + 1}集' : _episodeName,
+    );
+    if (!mounted) return;
+    setState(() {
+      _skipIntro = intro;
+      _skipOutro = outro;
+      _skipInheritedFrom = '';
+      _outroFired = false;
+    });
+  }
+
   Future<void> _showSkipSettings() async {
     final introCtrl = TextEditingController(
       text: _skipIntro > 0 ? '$_skipIntro' : '',
@@ -3404,7 +3498,8 @@ class _PlayerPageState extends State<PlayerPage>
                       const SizedBox(height: 10),
                       Text(
                         '保存后对本资源所有剧集生效；片头 = 起播直接跳到该秒数，'
-                        '片尾 = 距结尾还剩这么多秒时自动跳下一集。',
+                        '片尾 = 距结尾还剩这么多秒时自动跳下一集。\n'
+                        '进度条上右键可直接取点：开头 5 分钟算片头，结尾 5 分钟算片尾。',
                         style: Theme.of(ctx).textTheme.bodySmall
                             ?.copyWith(height: 1.5),
                       ),
@@ -3431,27 +3526,13 @@ class _PlayerPageState extends State<PlayerPage>
         ],
       ),
     );
-    final resource = '${_detail.sourceKey}|${_detail.id}';
-    final episodeKey = _episodeKey(_index);
     final intro = action == 'clear' ? 0 : clampSkipSeconds(introCtrl.text);
     final outro = action == 'clear' ? 0 : clampSkipSeconds(outroCtrl.text);
     introCtrl.dispose();
     outroCtrl.dispose();
     if (action == null) return;
-    await _app.saveSkipSegment(
-      resource: resource,
-      episode: episodeKey,
-      intro: intro,
-      outro: outro,
-      label: _episodeName.isEmpty ? '第${_index + 1}集' : _episodeName,
-    );
+    await _saveSkipSegments(intro, outro);
     if (!mounted) return;
-    setState(() {
-      _skipIntro = intro;
-      _skipOutro = outro;
-      _skipInheritedFrom = '';
-      _outroFired = false;
-    });
     if (action == 'clear') {
       _toast('已清除该资源所有剧集的跳过设置');
       return;
