@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:flutter/foundation.dart' show visibleForTesting;
 import 'package:path/path.dart' as p;
 
 import '../../core/logging/app_log.dart';
@@ -350,11 +351,17 @@ class LocalRelay {
       }
     }
 
+    // ★ 网盘 CDN 的「跨度限速」：夸克 / 百度 / UC 的直链只要 Range 是**开放式**
+    //   （`bytes=0-`）或跨度太大（实测 >~360MB 就触发），同一节点会被压到 ~0.1 MB/s，
+    //   播放器表现为「能出画面但极慢、几乎无法播放」。
+    //   同一地址改成 `bytes=0-33554431`（32MB）立刻回到 10–19 MB/s —— 与跨度成反比。
+    //   这里把请求窗口夹到安全值再打上游；上游回 206 + 真实 Content-Range，
+    //   播放器看到「给的比要的少」会自然续请求下一段，语义完全合规。
     final upstream = await _open(
       target,
       headers: headers,
       method: request.method,
-      range: range,
+      range: clampRange(range),
     );
     final finalUrl = _finalUrl(upstream, target);
     final contentType = _responseContentType(upstream);
@@ -448,6 +455,44 @@ class LocalRelay {
         await res.close();
       } catch (_) {}
     }
+  }
+
+  /// 单次上游请求的 Range 跨度上限（32MB）。
+  ///
+  /// 实测（夸克 672MB / 2GB 两个直链，同一 cookie、同一节点）：
+  ///   · `bytes=0-`（开放）→ 0.1 MB/s
+  ///   · 跨度 2GB / 1GB / 512MB → 0.1 MB/s
+  ///   · 跨度 400MB / 350MB → 0.1 / 4.6 MB/s（阈值在 ~360MB 附近）
+  ///   · 跨度 300MB / 256MB → 5.4 / 7.8 MB/s
+  ///   · 跨度 128MB / 64MB / 32MB → 9.8 / 9.6 / 13.0 MB/s
+  ///   · 跨度 16MB / 8MB  → 8.5 / 19.2 MB/s
+  /// 也就是说**速度与请求跨度反相关**，开放 Range 是最差的一种。
+  /// 播放器（尤其 fvp / mpv）开场习惯发 `bytes=0-`，正好踩在这个坑上。
+  static const int _maxUpstreamRangeBytes = 32 * 1024 * 1024;
+
+  /// 把播放器的 Range 夹到安全跨度；无法解析时原样透传（不猜）。
+  ///
+  /// 只处理单区间 `bytes=<start>-<end|*>`：多区间（带逗号）与 `-<suffix>` 形态
+  /// 直接透传 —— 那些在媒体播放里几乎不出现，改动它们风险大于收益。
+  @visibleForTesting
+  static String? clampRange(String? range) {
+    if (range == null || range.trim().isEmpty) return range;
+    final m = RegExp(
+      r'^bytes\s*=\s*(\d+)\s*-\s*(\d*)$',
+      caseSensitive: false,
+    ).firstMatch(range.trim());
+    if (m == null) return range;
+    final start = int.tryParse(m.group(1)!);
+    if (start == null || start < 0) return range;
+    final endText = m.group(2)!.trim();
+    if (endText.isEmpty) {
+      // 开放区间：夹成固定跨度
+      return 'bytes=$start-${start + _maxUpstreamRangeBytes - 1}';
+    }
+    final end = int.tryParse(endText);
+    if (end == null || end < start) return range;
+    if (end - start + 1 <= _maxUpstreamRangeBytes) return range;
+    return 'bytes=$start-${start + _maxUpstreamRangeBytes - 1}';
   }
 
   /// 只把音视频 / 图片 / 二进制当作可缓存内容，避免把 HTML 错误页写进缓存。
@@ -910,7 +955,9 @@ class LocalRelay {
     Map<String, String> headers,
   ) async {
     final res = request.response;
-    final range = request.headers.value(HttpHeaders.rangeHeader);
+    // `do=pan` 解出来的百度 / UC / 夸克直链最终也走这里，同样会撞上 CDN 的跨度限速，
+    // 所以和 `/play` 用同一套夹取规则。
+    final range = clampRange(request.headers.value(HttpHeaders.rangeHeader));
     final upstream = await _open(
       target,
       headers: headers,
