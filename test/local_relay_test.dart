@@ -52,6 +52,8 @@ void main() {
   late LocalRelay relay;
   late _FakeBtSource bt;
   final hash = List<String>.filled(40, 'b').join();
+  final cookieSeen = <String>[];
+  var deadHits = 0;
 
   setUpAll(() async {
     root = await Directory.systemTemp.createTemp('kniephos-relay-');
@@ -65,6 +67,26 @@ void main() {
       final res = req.response;
       if (req.uri.path == '/dav-only') {
         res.write('auth:${req.headers.value(HttpHeaders.authorizationHeader)}');
+        await res.close();
+        return;
+      }
+      if (req.uri.path == '/index.mpd') {
+        // B 站（wex 的 BiliGuard）下发的 DASH 清单：分片地址在 <BaseURL> 里，
+        // 且 CDN 按 Referer 防盗链 —— 与 m3u8 一样必须改写回中继。
+        res.headers.set('content-type', 'application/dash+xml');
+        res.write(
+          '<?xml version="1.0"?>\n'
+          '<MPD xmlns="urn:mpeg:dash:schema:mpd:2011">\n'
+          '<Period>\n'
+          '<AdaptationSet>\n'
+          '<Representation id="32_7" bandwidth="36943">\n'
+          '<BaseURL>http://127.0.0.1:${upstream.port}/bili-cdn.mp4</BaseURL>\n'
+          '<SegmentBase indexRange="938-6005"><Initialization range="0-937"/></SegmentBase>\n'
+          '</Representation>\n'
+          '</AdaptationSet>\n'
+          '</Period>\n'
+          '</MPD>\n',
+        );
         await res.close();
         return;
       }
@@ -133,6 +155,64 @@ void main() {
           'cookie:${req.headers.value(HttpHeaders.cookieHeader) ?? ''}\n',
         );
         res.write('ua:${req.headers.value(HttpHeaders.userAgentHeader) ?? ''}');
+        await res.close();
+        return;
+      }
+      if (req.uri.path == '/cookie-session.mp4') {
+        // 模拟网盘会话中途过期：第一次 403 并下发刷新后的 __puus，
+        // 带上新 Cookie 后才给 200。
+        final cookie =
+            req.headers.value(HttpHeaders.cookieHeader) ?? '';
+        cookieSeen.add(cookie);
+        if (!cookie.contains('__puus=fresh')) {
+          res.statusCode = 403;
+          res.headers.add(
+            HttpHeaders.setCookieHeader,
+            '__puus=fresh; Path=/; HttpOnly',
+          );
+          res.write('expired');
+          await res.close();
+          return;
+        }
+        res.write('ok:$cookie');
+        await res.close();
+        return;
+      }
+      if (req.uri.path == '/always-403.mp4') {
+        deadHits++;
+        res.statusCode = 403;
+        await res.close();
+        return;
+      }
+      if (req.uri.path == '/redirect-ua') {
+        // 跨源 302（127.0.0.1 → localhost）：模拟百度 dlink → baidupcs CDN。
+        res.statusCode = HttpStatus.found;
+        res.headers.set(
+          HttpHeaders.locationHeader,
+          'http://localhost:${upstream.port}/headers',
+        );
+        await res.close();
+        return;
+      }
+      if (req.uri.path == '/redirect-m3u8') {
+        res.statusCode = HttpStatus.found;
+        res.headers.set(
+          HttpHeaders.locationHeader,
+          'http://127.0.0.1:${upstream.port}/sub/index.m3u8',
+        );
+        await res.close();
+        return;
+      }
+      if (req.uri.path == '/sub/index.m3u8') {
+        res.headers.set('content-type', 'application/vnd.apple.mpegurl');
+        res.write('#EXTM3U\n#EXTINF:1.0,\nseg1.ts\n#EXT-X-ENDLIST\n');
+        await res.close();
+        return;
+      }
+      if (req.uri.path == '/range-echo') {
+        res.write(
+          'range:${req.headers.value(HttpHeaders.rangeHeader) ?? ''}',
+        );
         await res.close();
         return;
       }
@@ -222,6 +302,21 @@ void main() {
     expect(body, contains('ref:https://www.bilibili.com/'));
   });
 
+  test('DASH(MPD)：<BaseURL> 递归改写回中继，分片才不会缺 Referer', () async {
+    // 内置内核播不了 DASH，但中继仍要把清单改对：外部播放器 / 未来内核要用；
+    // 而且改写后的 BaseURL 经中继取流时会带上 Referer（B 站 CDN 否则 403）。
+    final target = 'http://127.0.0.1:${upstream.port}/index.mpd';
+    final body = await get(relay.playUrl(target, provider: 'bili'));
+    expect(body, contains('<MPD'));
+    expect(body, contains('${relay.baseUrl}/play?'),
+        reason: 'BaseURL 必须换成中继地址');
+    expect(
+      body.contains('127.0.0.1:${upstream.port}/bili-cdn.mp4'),
+      isFalse,
+      reason: '原始 CDN 地址不能留在清单里，否则分片绕开中继、丢 Referer',
+    );
+  });
+
   test('m3u8：去广告 + 分片/密钥递归改写回中继', () async {
     final target = 'http://127.0.0.1:${upstream.port}/index.m3u8';
     final body = await get(relay.playUrl(target));
@@ -239,6 +334,46 @@ void main() {
     expect(body, 'seen:ok');
   });
 
+  test('/play 手动跟随 302：保留自定义 UA，跨源丢弃 Cookie', () async {
+    // Dart 的 followRedirects 会把新请求的 UA 换成默认 Dart/x.y，百度 CDN
+    // 按 UA 判防盗链就会 403。手动跟随必须保住 UA，同时不把本机 Cookie 外泄。
+    final target = 'http://127.0.0.1:${upstream.port}/redirect-ua';
+    final body = await get(
+      relay.playUrl(
+        target,
+        headers: const {
+          'User-Agent': 'CustomUA/1.0',
+          'Cookie': 'session=secret',
+        },
+      ),
+    );
+    expect(body, contains('ua:CustomUA/1.0'));
+    expect(body, isNot(contains('session=secret')));
+  });
+
+  test('/play 302 后的 m3u8 相对分片按最终地址解析', () async {
+    // 重定向后仍用旧地址当 base，相对分片会指到 /seg1.ts（404）。
+    final target = 'http://127.0.0.1:${upstream.port}/redirect-m3u8';
+    final body = await get(relay.playUrl(target));
+    final decoded = Uri.decodeComponent(body);
+    expect(decoded, contains('${upstream.port}/sub/seg1.ts'));
+    expect(decoded, isNot(contains('${upstream.port}/seg1.ts')));
+  });
+
+  test('/play 只对网盘线路夹取 Range，普通线路原样透传', () async {
+    final target = 'http://127.0.0.1:${upstream.port}/range-echo';
+    final clamped = await fetch(
+      relay.playUrl(target, provider: 'quark'),
+      headers: const {'Range': 'bytes=0-'},
+    );
+    expect(utf8.decode(clamped.bytes), 'range:bytes=0-33554431');
+    final plain = await fetch(
+      relay.playUrl(target, provider: 'bili'),
+      headers: const {'Range': 'bytes=0-'},
+    );
+    expect(utf8.decode(plain.bytes), 'range:bytes=0-');
+  });
+
   test('/play 请求头换成短 token，URL 不带 Cookie 明文', () async {
     final target = 'http://127.0.0.1:${upstream.port}/headers';
     final cookie =
@@ -252,6 +387,54 @@ void main() {
     final body = await get(wrapped);
     expect(body, contains('cookie:$cookie'));
     expect(body, contains('ua:TestUA'));
+  });
+
+  test('/play 403 时记录 Set-Cookie 并用刷新后的 Cookie 重试一次', () async {
+    cookieSeen.clear();
+    final target = 'http://127.0.0.1:${upstream.port}/cookie-session.mp4';
+    final body = await get(relay.playUrl(target, provider: 'cookie-test'));
+    expect(body, contains('__puus=fresh'));
+    expect(cookieSeen.length, 2);
+    expect(cookieSeen.first, isNot(contains('__puus=fresh')));
+    expect(cookieSeen.last, contains('__puus=fresh'));
+  });
+
+  test('/play 会话 Cookie 与账号 Cookie 合并，同名以新值覆盖', () async {
+    cookieSeen.clear();
+    final target = 'http://127.0.0.1:${upstream.port}/cookie-session.mp4';
+    final headers = {
+      'Cookie': '__pus=old; __puus=stale; foo=bar',
+    };
+    final body = await get(
+      relay.playUrl(target, headers: headers, provider: 'cookie-merge'),
+    );
+    expect(body, contains('__pus=old'));
+    expect(body, contains('foo=bar'));
+    expect(body, contains('__puus=fresh'));
+    expect(body, isNot(contains('__puus=stale')));
+    expect(cookieSeen.length, 2);
+  });
+
+  test('/play 后续分片直接复用会话 Cookie，不再触发 403', () async {
+    cookieSeen.clear();
+    final target = 'http://127.0.0.1:${upstream.port}/cookie-session.mp4';
+    final url = relay.playUrl(target, provider: 'cookie-keep');
+    await get(url);
+    cookieSeen.clear();
+    final body = await get(url);
+    expect(cookieSeen.length, 1);
+    expect(cookieSeen.single, contains('__puus=fresh'));
+    expect(body, contains('__puus=fresh'));
+  });
+
+  test('/play 403 且没有新 Cookie 时只请求一次，不无限重试', () async {
+    deadHits = 0;
+    final target = 'http://127.0.0.1:${upstream.port}/always-403.mp4';
+    final result = await fetch(
+      relay.playUrl(target, provider: 'cookie-dead'),
+    );
+    expect(result.status, 403);
+    expect(deadHits, 1);
   });
 
   test('/play 超长目标地址换短 token，URL 不超过 FFmpeg 上限', () async {
@@ -386,5 +569,137 @@ void main() {
     final direct = await http.getText('http://127.0.0.1:$port/ua-only');
     expect(direct.url, 'http://127.0.0.1:$port/ua-only');
     expect(direct.body, startsWith('ua:'));
+  });
+
+  group('跨站访问控制', () {
+    test('跨站读 /file 被拒绝，原生客户端（无 Origin）照常可读', () async {
+      final ok = await fetch('${relay.baseUrl}/file/hello.txt');
+      expect(ok.status, 200);
+      expect(utf8.decode(ok.bytes), 'local-file-ok');
+
+      // 浏览器从第三方页面发起：带 Origin 且跨站 → 403，且不会回显 CORS。
+      final blocked = await fetch(
+        '${relay.baseUrl}/file/hello.txt',
+        headers: {'origin': 'https://evil.example'},
+      );
+      expect(blocked.status, HttpStatus.forbidden);
+      expect(
+        blocked.headers.value('access-control-allow-origin'),
+        isNull,
+        reason: '拒绝时不能回写 CORS 头，否则页面仍能读到正文',
+      );
+    });
+
+    test('跨站读 /pkg 被拒绝', () async {
+      final blocked = await fetch(
+        '${relay.baseUrl}/pkg/anything',
+        headers: {'origin': 'https://evil.example'},
+      );
+      expect(blocked.status, HttpStatus.forbidden);
+    });
+
+    test('跨站访问 /proxy 被拒绝（防止借中继凭据代取任意地址）', () async {
+      final target = Uri.encodeComponent(
+        'http://127.0.0.1:${upstream.port}/ua-only',
+      );
+      final blocked = await fetch(
+        '${relay.baseUrl}/proxy?do=proxy&url=$target',
+        headers: {'origin': 'https://evil.example'},
+      );
+      expect(blocked.status, HttpStatus.forbidden);
+    });
+
+    test('跨站访问 /play：带访问令牌才过令牌闸，随后仍受私网 SSRF 限制', () async {
+      final target = 'http://127.0.0.1:${upstream.port}/ua-only';
+      final url = '${relay.playUrl(target)}&rt=${relay.accessToken}';
+      final result = await fetch(
+        url,
+        headers: {'origin': 'https://player.example'},
+      );
+      // 测试上游在 127.0.0.1：令牌通过后，浏览器请求仍被私网规则拦下。
+      expect(result.status, HttpStatus.forbidden);
+      expect(
+        utf8.decode(result.bytes),
+        contains('禁止访问本机/内网地址'),
+        reason: '不是令牌问题，而是已授权的浏览器也不许借中继访问内网',
+      );
+      expect(
+        result.headers.value('access-control-allow-origin'),
+        'https://player.example',
+      );
+      expect(result.headers.value('vary'), contains('Origin'));
+    });
+
+    test('浏览器请求没有令牌一律拒绝（含跨站 / 同源）', () async {
+      final noToken = await fetch(
+        relay.playUrl('http://127.0.0.1:${upstream.port}/ua-only'),
+        headers: {'origin': 'https://player.example'},
+      );
+      expect(noToken.status, HttpStatus.forbidden);
+
+      final wrongToken = await fetch(
+        '${relay.playUrl('http://127.0.0.1:${upstream.port}/ua-only')}'
+        '&rt=not-the-token',
+        headers: {'origin': 'https://player.example'},
+      );
+      expect(wrongToken.status, HttpStatus.forbidden);
+    });
+
+    test('同源请求也要令牌，防止 DNS rebinding', () async {
+      final origin = 'http://127.0.0.1:${relay.port}';
+      final denied = await fetch(
+        '${relay.baseUrl}/file/hello.txt',
+        headers: {'origin': origin},
+      );
+      expect(denied.status, HttpStatus.forbidden);
+
+      final result = await fetch(
+        '${relay.baseUrl}/file/hello.txt?rt=${relay.accessToken}',
+        headers: {'origin': origin},
+      );
+      expect(result.status, 200);
+      expect(
+        result.headers.value('access-control-allow-origin'),
+        origin,
+      );
+    });
+
+    test('已授权的浏览器请求也不能借中继访问内网（SSRF）', () async {
+      final target = Uri.encodeComponent(
+        'http://127.0.0.1:${upstream.port}/ua-only',
+      );
+      final viaProxy = await fetch(
+        '${relay.baseUrl}/proxy?do=proxy&url=$target&rt=${relay.accessToken}',
+        headers: {'origin': 'https://player.example'},
+      );
+      expect(viaProxy.status, HttpStatus.forbidden);
+
+      final viaPlay = await fetch(
+        '${relay.playUrl('http://127.0.0.1:${upstream.port}/ua-only')}'
+        '&rt=${relay.accessToken}',
+        headers: {'origin': 'https://player.example'},
+      );
+      expect(viaPlay.status, HttpStatus.forbidden);
+    });
+
+    test('壳的 do=ck 探测（无 Origin）仍回 ok，宿主代理握手不受影响', () async {
+      final result = await fetch('${relay.baseUrl}/proxy?do=ck');
+      expect(result.status, 200);
+      expect(utf8.decode(result.bytes), 'ok');
+    });
+
+    test('跨站 OPTIONS 预检不泄漏敏感路由', () async {
+      final client = HttpClient();
+      addTearDown(() => client.close(force: true));
+      final req = await client.openUrl(
+        'OPTIONS',
+        Uri.parse('${relay.baseUrl}/file/hello.txt'),
+      );
+      req.headers.set('origin', 'https://evil.example');
+      final res = await req.close();
+      await res.drain<void>();
+      expect(res.statusCode, HttpStatus.forbidden);
+      expect(res.headers.value('access-control-allow-origin'), isNull);
+    });
   });
 }

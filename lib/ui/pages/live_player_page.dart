@@ -18,6 +18,7 @@ import '../../models/live.dart';
 import '../../models/site_config.dart';
 import '../../models/user_data.dart';
 import '../../services/live/epg.dart';
+import '../../services/live/live_ua_policy.dart';
 import '../../services/live_service.dart';
 import '../../services/boss_key/boss_key_service.dart';
 import '../../services/relay/local_relay.dart';
@@ -178,15 +179,25 @@ class _LivePlayerPageState extends State<LivePlayerPage>
   Future<void> _open(LiveLine line) async {
     // 频道地址可能带 `@referer=...@user-agent=...` 形式的头（TVBox 常见写法）：
     // 直接丢给 Uri.parse 会得到一个无效地址，播放器只能报 invalid media。
+    var cleanUrl = splitUrlHeadersClean(line.url);
     final inline = splitUrlHeaders(line.url);
     final headers = <String, String>{
       ...?_channel.header,
       ...inline,
-      if (_channel.ua.isNotEmpty) 'User-Agent': _channel.ua,
+      // 频道自己的 ua 只在还没有 UA 时补上：订阅 header 里可能已经用小写
+      // `user-agent` 写过，两个键并存时发包用哪个取决于遍历顺序。
+      if (_channel.ua.isNotEmpty &&
+          liveHeaderValue(_channel.header ?? const {}, 'user-agent').isEmpty &&
+          liveHeaderValue(inline, 'user-agent').isEmpty)
+        'User-Agent': _channel.ua,
       if (_channel.referer.isNotEmpty) 'Referer': _channel.referer,
       if (_channel.origin.isNotEmpty) 'Origin': _channel.origin,
     };
-    var cleanUrl = splitUrlHeadersClean(line.url);
+    // 自定义直播 UA（设置 → 直播源）按**实际取流地址**再解一次：直播单地址与
+    // 频道流地址常常不在同一个 host（CDN 线路），只信列表阶段的结果会漏。
+    // 头名大小写不敏感：订阅里常写小写 `user-agent`，直接读 `User-Agent`
+    // 会当成「没有 UA」，再写一个同名不同大小写的键。
+    applyLiveStreamUa(headers, cleanUrl);
     AppLog.i(
       'live',
       '打开直播 ${_channel.name} scheme=${Uri.tryParse(cleanUrl)?.scheme} '
@@ -843,9 +854,8 @@ class _LivePlayerPageState extends State<LivePlayerPage>
             autofocus: true,
             onKeyEvent: _onKey,
             child: MouseRegion(
-              onHover: (_) {
-                if (!_controls) _showControls();
-              },
+              // 鼠标移动不再唤出控制栏：与点播播放器一致，改为单击切换
+              // （_handleTap）。移开期间仍由 4 秒计时器自动收缩。
               child: GestureDetector(
                 // 画面为空时（加载中 / 出错）整块区域没有可命中的子组件，
                 // 必须用 opaque 才能让点击回到控制栏显隐逻辑。

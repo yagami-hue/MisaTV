@@ -1,3 +1,4 @@
+import '../core/logging/log_redact.dart';
 import 'site_config.dart';
 import 'vod.dart';
 
@@ -17,6 +18,7 @@ class SourceHealth {
     required this.message,
     this.items = 0,
     this.classes = 0,
+    this.elapsedMs = 0,
   });
 
   final String key;
@@ -26,8 +28,21 @@ class SourceHealth {
   final int items;
   final int classes;
 
+  /// 本次探测耗时（毫秒）；0 表示未统计（如冷却跳过）。
+  final int elapsedMs;
+
   bool get ok => status == 'ok-content' || status == 'ok-classes';
   bool get needsExt => status == 'needs-ext';
+
+  SourceHealth withElapsed(int ms) => SourceHealth(
+    key: key,
+    name: name,
+    status: status,
+    message: message,
+    items: items,
+    classes: classes,
+    elapsedMs: ms,
+  );
 
   factory SourceHealth.fromHome(SourceBean site, CmsResult result) {
     final items = result.items.length;
@@ -72,12 +87,14 @@ class SourceHealth {
   }
 
   factory SourceHealth.failure(SourceBean site, Object error) {
-    final message = error is SourceException ? error.message : '$error';
+    final raw = error is SourceException ? error.message : '$error';
+    // 审计报告会导出给用户 / 贴到反馈里：先把 URL 里的凭据遮掉。
+    final message = redactQueryValues(raw.replaceAll('\n', ' ').trim());
     return SourceHealth(
       key: site.key,
       name: site.displayName,
       status: 'error',
-      message: message.isEmpty ? '请求失败' : message,
+      message: message.isEmpty ? '请求失败' : shorten(message, 300),
     );
   }
 

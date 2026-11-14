@@ -1,5 +1,6 @@
 // 弹幕搜索前的资源名清洗（对齐旧版 src/engine/danmaku/normalizeQuery.ts）：
 // 生成搜索候选词 / 解析「集」输入框 / 候选显示压缩。
+import '../matching/episode_normalizer.dart';
 import 'danmaku_endpoints.dart';
 
 final RegExp _fullWidthRe = RegExp(r'[\uFF01-\uFF5E]');
@@ -73,74 +74,24 @@ String _stripEp(String v) {
 /// 解析「集」输入框内容：`S01E10` / `1x10` / `E10` / `第10集` / `10` / `更新至10` / `第2季`。
 /// 认不出来返回空对象（调用方回退「从资源名提取」）。
 EpisodeInput parseEpisodeInput(String raw) {
-  final s = _fullToHalf(raw).trim();
-  if (s.isEmpty) return const EpisodeInput();
-  final se = RegExp(r'[Ss](\d{1,2})\s*[Ee][Pp]?\s*(\d{1,4})').firstMatch(s) ??
-      RegExp(r'(\d{1,3})\s*[xX]\s*(\d{1,4})').firstMatch(s);
-  if (se != null) {
-    return EpisodeInput(
-      season: int.tryParse(se.group(1)!),
-      ep: _stripEp(se.group(2)!),
-    );
-  }
-  int? season;
-  final sn = RegExp(r'第\s*(\d{1,3})\s*[季部]').firstMatch(s) ??
-      RegExp(r'(?:^|\b)s(?:eason)?\s*(\d{1,2})(?![0-9])', caseSensitive: false)
-          .firstMatch(s);
-  if (sn != null) season = int.tryParse(sn.group(1)!);
-  String? ep;
-  final epMatch = RegExp(r'[Ee][Pp]?\s*(\d{1,4})').firstMatch(s) ??
-      RegExp(r'第\s*(\d{1,4})\s*[集话期]').firstMatch(s) ??
-      RegExp(r'(?:更新至|至)\s*(\d{1,4})').firstMatch(s) ??
-      RegExp(r'^\s*(\d{1,4})\s*$').firstMatch(s);
-  if (epMatch != null) ep = _stripEp(epMatch.group(1)!);
-  return EpisodeInput(season: season, ep: ep);
+  final info = normalizeEpisodeInfo(raw);
+  return EpisodeInput(
+    season: info.season,
+    ep: info.episode == null ? null : '${info.episode}',
+  );
 }
 
 /// 「集」输入框初值（由资源名生成）：`S01E10` → `S1E10`；`第10集`/末尾数字 → `10`。
 String episodeFieldFromName(String name) {
-  final s = name.trim();
-  if (s.isEmpty) return '';
-  final se = RegExp(r'[Ss](\d{1,2})\s*[Ee](\d{1,4})').firstMatch(s);
-  if (se != null) {
-    final season = int.tryParse(se.group(1)!) ?? 0;
-    return 'S${season}E${_stripEp(se.group(2)!).padLeft(2, '0')}';
+  final info = normalizeEpisodeInfo(name);
+  if (info.season != null && info.episode != null) {
+    return 'S${info.season}E${'${info.episode}'.padLeft(2, '0')}';
   }
-  final cn = RegExp(r'第\s*(\d{1,4})\s*[集话期]').firstMatch(s);
-  if (cn != null) return _stripEp(cn.group(1)!);
-  final e = RegExp(r'[Ee][Pp]?\s*(\d{1,4})(?![0-9])').firstMatch(s);
-  if (e != null) return _stripEp(e.group(1)!);
-  // 末尾/独立数字（避免向前吞掉字母：只认前后都不是 ASCII 字母数字的孤立数字）。
-  for (final m in RegExp(r'\d+').allMatches(s)) {
-    final before = m.start > 0 ? s.codeUnitAt(m.start - 1) : 0;
-    final after = m.end < s.length ? s.codeUnitAt(m.end) : 0;
-    if (_isAsciiAlnum(before) || _isAsciiAlnum(after)) continue;
-    final run = m.group(0)!;
-    if (run.length > 3) continue;
-    return _stripEp(run);
-  }
-  return '';
+  return info.episode?.toString() ?? '';
 }
 
-bool _isAsciiAlnum(int c) =>
-    (c >= 0x30 && c <= 0x39) || (c >= 0x41 && c <= 0x5A) || (c >= 0x61 && c <= 0x7A);
-
-/// 从文本里提集号：`第N话/集/期` → N；`SxxExx` → xx；`更新至N` → N；纯数字（非年份）→ N。
-String _epNumberOf(String s) {
-  final t = _fullToHalf(s).trim();
-  if (t.isEmpty) return '';
-  final se = RegExp(r'[Ss]\d{1,2}\s*[Ee]\s*(\d{1,4})').firstMatch(t);
-  if (se != null) return _stripEp(se.group(1)!);
-  final cn = RegExp(r'第\s*(\d{1,4})\s*[集话期]').firstMatch(t);
-  if (cn != null) return _stripEp(cn.group(1)!);
-  final up = RegExp(r'(?:更新至|至)\s*(\d{1,4})\s*[集话期]?').firstMatch(t);
-  if (up != null) return _stripEp(up.group(1)!);
-  final pure = RegExp(r'^\s*(\d{1,4})\s*$').firstMatch(t);
-  if (pure != null && !RegExp(r'^(?:19|20)\d{2}$').hasMatch(pure.group(1)!)) {
-    return _stripEp(pure.group(1)!);
-  }
-  return '';
-}
+/// 从文本里提集号：`第N话/集/期`、`SxxExx`、`更新至N`、纯数字（非年份）。
+String _epNumberOf(String s) => normalizeEpisodeInfo(s).episode?.toString() ?? '';
 
 /// 弹幕候选显示压缩：`斗破苍穹年番 第212话` → `斗破苍穹年番 · 第212集`。
 String formatCandidateLabel({
@@ -166,10 +117,16 @@ String formatCandidateLabel({
         ),
         ' ',
       )
-      .replaceAll(RegExp(r'第\s*(?:\d{1,2}|[一二三四五六七八九十]{1,3})\s*[季部]'), ' ')
+      .replaceAll(
+        RegExp(r'第\s*(?:[0-9零〇一二三四五六七八九十百两兩]+)\s*[季部]'),
+        ' ',
+      )
       .replaceAll(RegExp(r'[Ss](?:eason)?\s*\d{1,2}\s*[Ee]\s*\d{1,4}'), ' ')
       .replaceAll(RegExp(r'[Ss]\s*\d{1,2}(?![0-9A-Za-z])'), ' ')
-      .replaceAll(RegExp(r'第\s*\d{1,4}\s*[集话期]'), ' ')
+      .replaceAll(
+        RegExp(r'第\s*(?:[0-9零〇一二三四五六七八九十百两兩]+)\s*[集话話期]'),
+        ' ',
+      )
       .replaceAll(RegExp(r'(?:更新至|全)\s*\d{1,4}\s*[集话期]?'), ' ')
       .replaceAll(RegExp(r'\s{2,}'), ' ')
       .replaceAll(RegExp(r'[\s\-–—·:：|]+$'), '')

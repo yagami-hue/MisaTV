@@ -68,8 +68,20 @@ Future<void> _bootstrap(List<String> args) async {
   Future<void> Function()? appShutdown;
   registerAppShutdown(() async {
     AppLog.i('app', '开始退出清理');
-    await appShutdown?.call();
-    await AppLog.flush();
+    try {
+      await appShutdown?.call();
+    } finally {
+      // 无论清理是否超时都要落盘，否则日志里看不到最后一步。
+      await AppLog.flush().timeout(
+        const Duration(seconds: 2),
+        onTimeout: () {},
+      );
+      AppLog.i('app', '退出清理完成');
+      await AppLog.flush().timeout(
+        const Duration(seconds: 1),
+        onTimeout: () {},
+      );
+    }
   });
 
   setupPlayerEngine();
@@ -124,7 +136,13 @@ Future<void> _bootstrap(List<String> args) async {
   sourceService.jar.refreshDriveSession = state.refreshDriveSession;
   await state.init();
   // 老板键 / 托盘：桌面端初始化；热键被占用等情况只记日志，不影响启动。
-  if (!kIsWeb) await BossKeyService.instance.init(state);
+  //
+  // 注意：托盘图标**不能**在这里同步创建。Windows 上原生托盘需要窗口与消息
+  // 循环已经存在，而 runApp 在下面几十行之后才调用；更早创建会让
+  // `native_tray_icon_set_visible` 在引擎就绪前触碰 win32 shell，表现为
+  // 「日志停在『托盘菜单已创建』然后进程直接消失」（1.0.0 的崩溃现场）。
+  // 因此推迟到首帧之后，见下方 addPostFrameCallback。
+  final bossKey = kIsWeb ? null : BossKeyService.instance;
   driveSeed.addAll(state.driveLocalSeed);
   state.addListener(
     () => driveSeed
@@ -143,6 +161,8 @@ Future<void> _bootstrap(List<String> args) async {
       logger: (message) => AppLog.i('bt', message),
     );
     state.torrentPlay = torrentPlay;
+    // 下载管理器与磁力播放共用同一个 aria2 进程。
+    state.downloadManager.attach(() => torrentPlay.engine);
     // 第三方播放器的选集列表：M3U 里的每一项都回指本机中继，切集时按需解析。
     final externalPlaylist = ExternalPlaylistService(
       sourceService: sourceService,
@@ -171,15 +191,52 @@ Future<void> _bootstrap(List<String> args) async {
       cacheLimitMb: () => state.playerSettings.streamCacheMb,
       externalEpisodeResolver: externalPlaylist.resolveEpisode,
     );
+    // 蜘蛛调试口默认关闭：只有 `--dart-define=MISA_SPIDER_DEBUG=true` 的构建
+    // 才会注册（这个路由能执行任意蜘蛛脚本，不能默认敞开）。
+    const spiderDebugEnabled = bool.fromEnvironment('MISA_SPIDER_DEBUG');
+    if (spiderDebugEnabled) {
+      state.spiderDebug.enabled = true;
+      LocalRelay.instance.debugService = state.spiderDebug;
+      LocalRelay.instance.spiderDebugRunner = state.spiderDebugRunner;
+      AppLog.i(
+        'debug',
+        '蜘蛛调试已开启：http://127.0.0.1:${LocalRelay.instance.port}/debug/spider',
+      );
+    }
     // 订阅里的代理规则（`rules[].hosts`）命中的请求走中继的通用代理口。
     ProxyRules.relayBase = () => LocalRelay.instance.baseUrl;
     appShutdown = () async {
+      // 每一步都独立限时：任何一步卡住（JVM 不退、管道挂住、中继 close 等待
+      // 活跃连接）都不能拖住整个退出。以前 `sourceService.shutdown()` 里的
+      // 流取消没有超时，表现为「日志停在『开始退出清理』然后窗口假死」。
+      Future<void> step(String name, Future<void> Function() action) async {
+        try {
+          await action().timeout(const Duration(seconds: 3));
+        } catch (e) {
+          AppLog.w('app', '退出清理步骤失败（$name，忽略）：$e');
+        }
+      }
+
       // 先关独立播放器窗口：它有自己的 JVM/中继，必须在进程退出前收尾。
-      await closeAllStandalonePlayerWindows();
-      await sourceService.shutdown();
-      torrentPlay.dispose();
-      state.xunleiCloudService.dispose();
-      await LocalRelay.instance.stop();
+      await step('close-player-windows', closeAllStandalonePlayerWindows);
+      await step('spiders', sourceService.shutdown);
+      try {
+        state.watchParty.leave();
+        state.watchParty.dispose();
+      } catch (_) {}
+      try {
+        await state.lanServer.stop();
+      } catch (_) {}
+      try {
+        state.downloadManager.dispose();
+      } catch (_) {}
+      try {
+        torrentPlay.dispose();
+      } catch (_) {}
+      try {
+        state.xunleiCloudService.dispose();
+      } catch (_) {}
+      await step('relay', LocalRelay.instance.stop);
     };
   } else {
     appShutdown = sourceService.shutdown;
@@ -193,6 +250,13 @@ Future<void> _bootstrap(List<String> args) async {
   );
 
   runApp(KniephosApp(state: state));
+  // 首帧之后才初始化托盘 / 老板键：此时窗口与消息循环都已就绪，
+  // 原生托盘 API 才能安全调用（原因见上面 `bossKey` 处的注释）。
+  if (bossKey != null) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      unawaited(bossKey.init(state));
+    });
+  }
   // 开发用冒烟钩子：`--dart-define=MISA_TEST_POPOUT=<视频地址>` 启动后自动弹一个
   // 独立播放器窗口，用来验证多窗口链路（正式构建不带这个 define，等于空操作）。
   const testPopoutUrl = String.fromEnvironment('MISA_TEST_POPOUT');

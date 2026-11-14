@@ -8,6 +8,7 @@ import '../../models/user_data.dart';
 import '../../models/vod.dart';
 import '../../state/app_state.dart';
 import '../widgets/mouse_drag_scroll.dart';
+import 'focus_memory.dart';
 import 'immersive_category_page.dart';
 import 'immersive_widgets.dart';
 
@@ -28,6 +29,52 @@ class _ImmersiveHomePageState extends State<ImmersiveHomePage> {
   List<SortClass> _classes = const [];
   SourceBean? _site;
   int _total = 0;
+
+  /// 焦点记忆：从详情页返回时恢复到刚才那张卡片，而不是跳回第一张。
+  ///
+  /// 这里不需要 onChanged 刷新界面：高亮由每张卡自己 setState，
+  /// 外层只要在数据变化时调用 [_syncFocusKeys] 维护 key 集合即可。
+  final FocusMemory _focusMemory = FocusMemory();
+
+  /// `货架下标:条目下标` → FocusNode。按内容 key 缓存，列表刷新后复用同一节点。
+  final Map<String, FocusNode> _focusNodes = {};
+
+  /// 首页整体的键盘 / 遥控器焦点入口：方向键在货架之间移动。
+  final FocusNode _rootFocus = FocusNode(debugLabel: 'immersive-home');
+
+  @override
+  void initState() {
+    super.initState();
+  }
+
+  @override
+  void dispose() {
+    for (final node in _focusNodes.values) {
+      node.dispose();
+    }
+    _focusNodes.clear();
+    _rootFocus.dispose();
+    super.dispose();
+  }
+
+  /// 取（或建）某个卡片的焦点节点。
+  FocusNode _focusNodeFor(String key) => _focusNodes.putIfAbsent(
+    key,
+    () => FocusNode(debugLabel: 'immersive-card-$key'),
+  );
+
+  /// 货架内容变化后：同步有效 key，释放已消失卡片的节点。
+  void _syncFocusKeys() {
+    final keys = <String>[
+      for (var s = 0; s < _shelves.length; s++)
+        for (var i = 0; i < _shelves[s].items.length; i++) '$s:$i',
+      for (var i = 0; i < _classes.length; i++) 'cls:$i',
+    ];
+    final removed = _focusMemory.syncKeys(keys);
+    for (final key in removed) {
+      _focusNodes.remove(key)?.dispose();
+    }
+  }
 
   @override
   void didChangeDependencies() {
@@ -207,9 +254,27 @@ class _ImmersiveHomePageState extends State<ImmersiveHomePage> {
         ];
         _loading = false;
       });
+      // 列表内容变了：同步焦点 key（释放已消失卡片的节点），
+      // 数据到位后再恢复上次位置，否则此时节点还不存在。
+      if (mounted) {
+        _syncFocusKeys();
+        _restoreFocusSoon();
+      }
     } catch (_) {
       if (mounted) setState(() => _loading = false);
     }
+  }
+
+  /// 等一帧再恢复焦点：卡片要先进树，FocusNode 才能被 requestFocus。
+  void _restoreFocusSoon() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      final target = _focusMemory.restoreTarget(fallback: '0:0');
+      if (target == null) return;
+      final node = _focusNodes[target];
+      if (node == null || !node.canRequestFocus) return;
+      node.requestFocus();
+    });
   }
 
   String _heroSubtitle(VodItem item, SourceBean site) {
@@ -293,11 +358,18 @@ class _ImmersiveHomePageState extends State<ImmersiveHomePage> {
       );
     }
 
-    return SingleChildScrollView(
-      padding: const EdgeInsets.only(bottom: 44),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
+    // 焦点容器把方向键交给 Flutter 的焦点树遍历（按几何顺序在货架间移动），
+    // 并开启自动滚动：焦点走到视口外的卡片时，外层 Scrollable 会跟随滚动。
+    // 这比自己算网格更稳（货架是横向滚动 + 多个分架的混合布局）。
+    return Focus(
+      focusNode: _rootFocus,
+      child: ScrollConfiguration(
+        behavior: const MouseDragScrollBehavior(),
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.only(bottom: 44),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
           ImmersiveHero(items: _hero, height: heroHeight),
           Padding(
             padding: const EdgeInsets.fromLTRB(56, 4, 56, 0),
@@ -418,15 +490,16 @@ class _ImmersiveHomePageState extends State<ImmersiveHomePage> {
             ),
             const SizedBox(height: 26),
           ],
-          for (final shelf in _shelves) ...[
+          for (var shelfIndex = 0; shelfIndex < _shelves.length; shelfIndex++) ...[
             Padding(
               padding: const EdgeInsets.fromLTRB(56, 0, 56, 0),
               child: ImmersiveShelf(
-                title: shelf.title,
-                itemCount: shelf.items.length,
+                title: _shelves[shelfIndex].title,
+                itemCount: _shelves[shelfIndex].items.length,
                 height: 232,
                 itemBuilder: (context, index) {
-                  final entry = shelf.items[index];
+                  final entry = _shelves[shelfIndex].items[index];
+                  final key = '$shelfIndex:$index';
                   return ImmersiveCard(
                     title: entry.title,
                     year: entry.year,
@@ -436,7 +509,13 @@ class _ImmersiveHomePageState extends State<ImmersiveHomePage> {
                     progress: entry.progress,
                     showText: false,
                     width: 310,
-                    onTap: () => _open(entry),
+                    focusNode: _focusNodeFor(key),
+                    onFocus: () => _focusMemory.remember(key),
+                    onTap: () {
+                      // 记住位置：从详情页返回时恢复到这里。
+                      _focusMemory.remember(key);
+                      _open(entry);
+                    },
                   );
                 },
               ),
@@ -444,6 +523,8 @@ class _ImmersiveHomePageState extends State<ImmersiveHomePage> {
             const SizedBox(height: 30),
           ],
         ],
+      ),
+        ),
       ),
     );
   }

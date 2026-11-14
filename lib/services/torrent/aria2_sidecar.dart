@@ -5,6 +5,7 @@ import 'dart:io';
 import 'package:flutter/services.dart';
 import 'package:path/path.dart' as p;
 
+import '../../models/download_task.dart';
 import 'magnet.dart';
 
 /// aria2 `getFiles` 条目（数值字段 JSON 里是**字符串**）。
@@ -299,6 +300,65 @@ class Aria2Sidecar {
       options,
     ], timeout: const Duration(seconds: 20));
   }
+
+  /// 通用添加（下载管理器用：http/https/ftp/磁力都走这里）。
+  Future<String> addDownload(
+    List<String> uris,
+    Map<String, String> options,
+  ) => _call<String>('aria2.addUri', [
+    uris,
+    options,
+  ], timeout: const Duration(seconds: 20));
+
+  /// 下载管理器：当前活动 / 等待 / 已结束任务。
+  Future<List<Map<String, dynamic>>> tellActive() =>
+      _tellList('aria2.tellActive', const []);
+
+  Future<List<Map<String, dynamic>>> tellWaiting({
+    int offset = 0,
+    int num = 100,
+  }) => _tellList('aria2.tellWaiting', [offset, num]);
+
+  Future<List<Map<String, dynamic>>> tellStopped({
+    int offset = 0,
+    int num = 100,
+  }) => _tellList('aria2.tellStopped', [offset, num]);
+
+  Future<List<Map<String, dynamic>>> _tellList(
+    String method,
+    List<Object?> leading,
+  ) async {
+    final keys = DownloadTask.statusKeys;
+    final raw = await _call<List<dynamic>>(method, [
+      ...leading,
+      keys,
+    ]);
+    return raw
+        .whereType<Map>()
+        .map((e) => Map<String, dynamic>.from(e))
+        .toList();
+  }
+
+  /// 全局速度统计（下载 / 上传）。
+  Future<Map<String, dynamic>> globalStat() async {
+    final raw = await _call<Map<String, dynamic>>(
+      'aria2.getGlobalStat',
+      const [],
+    );
+    return raw;
+  }
+
+  Future<void> pause(String gid) => _call<dynamic>('aria2.pause', [gid]);
+
+  Future<void> pauseAll() => _call<dynamic>('aria2.pauseAll', const []);
+
+  Future<void> unpauseAll() => _call<dynamic>('aria2.unpauseAll', const []);
+
+  Future<void> removeDownloadResult(String gid) =>
+      _call<dynamic>('aria2.removeDownloadResult', [gid]);
+
+  Future<void> changeGlobalOption(Map<String, String> options) =>
+      _call<dynamic>('aria2.changeGlobalOption', [options]);
 
   Future<Aria2Status> status(String gid) async {
     final raw = await _call<Map<String, dynamic>>('aria2.tellStatus', [

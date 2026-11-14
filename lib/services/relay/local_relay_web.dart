@@ -24,7 +24,13 @@ class LocalRelay {
 
   Future<int> streamCacheBytes() async => 0;
 
+  Future<int> streamCacheEntryCount() async => 0;
+
+  String get streamCacheDir => '';
+
   Future<void> clearStreamCache() async {}
+
+  void clearPlaySession([String? provider]) {}
 
   String playUrl(
     String url, {

@@ -415,10 +415,11 @@ class _HistoryPageState extends State<HistoryPage> {
 
     final raw = splitUrlHeadersClean(item.url);
     final storedRaw = item.rawUrl.trim();
-    // 已经失效的本机取流地址（加固壳 JVM 重启后端口就没了）。
+    // 已经失效的本机取流地址（加固壳 JVM 重启后端口就没了，/play 的 token
+    // 也只在本进程有效）。
     final staleLocal =
         (raw.contains('127.0.0.1') || raw.contains('localhost')) &&
-        RegExp(r'/chunk|/proxy').hasMatch(raw);
+        RegExp(r'/chunk|/proxy|/play').hasMatch(raw);
     final isDriveLine = driveHintFromFlag(item.flag) != null;
 
     // ★ 详情就是完整选集列表。续播时先拉一次详情，网盘线路也不例外，
@@ -461,7 +462,11 @@ class _HistoryPageState extends State<HistoryPage> {
                 ? PlayResult(
                     url: raw,
                     flag: flag,
-                    headers: splitUrlHeaders(item.url),
+                    // 直链往往依赖 Referer / UA：历史里存过就原样带上，
+                    // 旧记录没存时退回 URL 里内嵌的 `|` 头。
+                    headers: item.headers.isNotEmpty
+                        ? item.headers
+                        : splitUrlHeaders(item.url),
                   )
                 : null,
             startPositionMs: item.positionMs,
@@ -481,7 +486,9 @@ class _HistoryPageState extends State<HistoryPage> {
       final play = PlayResult(
         url: raw,
         flag: item.flag,
-        headers: splitUrlHeaders(item.url),
+        headers: item.headers.isNotEmpty
+            ? item.headers
+            : splitUrlHeaders(item.url),
       );
       await openVodPlayer(
         context,

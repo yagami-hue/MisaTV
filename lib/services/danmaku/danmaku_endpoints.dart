@@ -1,5 +1,6 @@
 // 外部弹幕接口的纯函数（对齐旧版 src/engine/danmaku/endpoints.ts）：
 // 地址归一、自定义接口解析、候选排序与挑选。无副作用，可独立单测。
+import '../matching/episode_normalizer.dart';
 import 'danmaku_models.dart';
 
 final RegExp _schemeRe = RegExp(r'^[a-z][a-z0-9+.\-]*://', caseSensitive: false);
@@ -128,51 +129,10 @@ String cleanTitle(String s) {
   return _fullToHalf(s).toLowerCase().replaceAll(_nonLetterNumber, '');
 }
 
-const Map<String, int> _cnNumMap = {
-  '一': 1,
-  '二': 2,
-  '三': 3,
-  '四': 4,
-  '五': 5,
-  '六': 6,
-  '七': 7,
-  '八': 8,
-  '九': 9,
-  '十': 10,
-};
-
-/// 中文数字（一~十 / 十一…）→ 数字；非汉字数字直接 Number。
-int? _cnNum(String s) {
-  final t = s.trim();
-  if (RegExp(r'^\d{1,2}$').hasMatch(t)) return int.tryParse(t);
-  final direct = _cnNumMap[t];
-  if (direct != null) return direct;
-  final m = RegExp(r'^十([一二三四五六七八九])$').firstMatch(t);
-  if (m != null) return 10 + _cnNumMap[m.group(1)]!;
-  final m2 = RegExp(r'^([一二三四五六七八九])十([一二三四五六七八九])?$').firstMatch(t);
-  if (m2 != null) {
-    return _cnNumMap[m2.group(1)]! * 10 +
-        (m2.group(2) == null ? 0 : _cnNumMap[m2.group(2)]!);
-  }
-  return null;
-}
-
 /// 从资源名 / 剧名里提取**季号**：`第2季` / `Season 2` / `S01` → 2 / 1；取不到 → null。
 int? seasonOf(String name) {
-  final cn = RegExp(r'第\s*(\d{1,2}|[一二三四五六七八九十]{1,3})\s*季').firstMatch(name);
-  if (cn != null) {
-    final n = _cnNum(cn.group(1)!);
-    if (n != null && n >= 1 && n <= 99) return n;
-  }
-  final en = RegExp(
-    r'(?:^|[^a-z0-9])s(?:eason)?\s*0?(\d{1,2})(?![0-9])',
-    caseSensitive: false,
-  ).firstMatch(name);
-  if (en != null) {
-    final n = int.tryParse(en.group(1)!);
-    if (n != null && n >= 1 && n <= 99) return n;
-  }
-  return null;
+  final season = normalizeEpisodeInfo(name).season;
+  return season != null && season >= 1 && season <= 99 ? season : null;
 }
 
 /// 标题季号与期望季的契合度：0 = 同季 / 1 = 标题无季信息（或未给期望季）/ 2 = 不同季。
@@ -291,10 +251,8 @@ int? epNumberOf(DanmakuCandidate c) {
   if (num != null) return num;
   final t = c.episodeTitle.trim();
   if (t.isEmpty) return null;
-  final m = RegExp(r'第\s*(\d{1,4})\s*[集话期]').firstMatch(t) ??
-      RegExp(r'(?:更新至|至)\s*(\d{1,4})\s*[集话期]?').firstMatch(t) ??
-      RegExp(r'[Ss]\d{1,2}\s*[Ee]\s*(\d{1,4})').firstMatch(t);
-  if (m != null) return _positive(m.group(1));
+  final normalized = normalizeEpisodeInfo(t).episode;
+  if (normalized != null) return normalized;
   // 兜底只认「独立数字」，并排除分辨率标记（4K）与年份（2024）。
   final tail = _looseNumber(t, 4);
   if (tail == null || RegExp(r'^(?:19|20)\d{2}$').hasMatch(tail)) return null;
@@ -303,10 +261,12 @@ int? epNumberOf(DanmakuCandidate c) {
 
 /// 候选是否为「第 targetEp 集」—— 接口集号字段优先，标题显式集号兜底。
 bool candidateMatchesEp(DanmakuCandidate c, String targetEp) {
-  final t = targetEp.replaceFirst(RegExp(r'^0+'), '');
+  final t = targetEp.replaceFirst(RegExp(r'^0+'), '').trim();
   if (t.isEmpty) return false;
   final n = epNumberOf(c);
-  return n != null && '$n' == t;
+  if (n != null) return '$n' == t;
+  // 日期集 / 区间集等没有纯数字集号时，再按归一化结果比较一次。
+  return matchEpisodes(targetEp, c.episodeTitle);
 }
 
 /// 候选列表**显示排序**：有集数的按集号升序排前面，没集数的保持原顺序放后面。

@@ -14,9 +14,10 @@ class DavException implements Exception {
   String toString() => message;
 }
 
-/// WebDAV 存储服务：服务器管理 + 目录浏览（PROPFIND）。
+/// WebDAV 存储服务：服务器管理 + 目录浏览（PROPFIND）+ 同步文件读写。
 ///
-/// 只读；播放不走这里（由 `/play` 中继 + `dav` 参数注入 Authorization 取流）。
+/// 播放不走这里（由 `/play` 中继 + `dav` 参数注入 Authorization 取流）；
+/// [getText] / [putText] 只给「多端同步」读写一份 JSON 用。
 class DavService {
   DavService(this._store);
 
@@ -80,6 +81,116 @@ class DavService {
     final server = byId(id);
     if (server == null) return '';
     return davBasicAuth(server.username, server.password);
+  }
+
+  /// 读取远端文本文件；文件不存在返回 null（首次同步很常见）。
+  Future<String?> getText(String id, String path) async {
+    final server = byId(id);
+    if (server == null) throw DavException('该 WebDAV 服务器不存在（可能已被删除）');
+    final target = davJoin(normalizeDavBase(server.url), path);
+    final auth = davBasicAuth(server.username, server.password);
+    final client = HttpClient()..connectionTimeout = const Duration(seconds: 15);
+    try {
+      final req = await client.getUrl(Uri.parse(target));
+      if (auth.isNotEmpty) {
+        req.headers.set(HttpHeaders.authorizationHeader, auth);
+      }
+      final res = await req.close();
+      final status = res.statusCode;
+      final builder = BytesBuilder(copy: false);
+      await for (final chunk in res) {
+        builder.add(chunk);
+      }
+      if (status == 404) return null;
+      if (status == 401) {
+        throw DavException('认证失败（HTTP 401）：请检查用户名与密码');
+      }
+      if (status < 200 || status >= 300) {
+        throw DavException('读取同步文件失败（HTTP $status）');
+      }
+      return utf8.decode(builder.takeBytes(), allowMalformed: true);
+    } on DavException {
+      rethrow;
+    } on SocketException catch (e) {
+      throw DavException('连接服务器失败：${e.message}');
+    } on HttpException catch (e) {
+      throw DavException('请求失败：${e.message}');
+    } catch (e) {
+      throw DavException('请求失败：$e');
+    } finally {
+      client.close(force: true);
+    }
+  }
+
+  /// 写入远端文本文件（覆盖）；父目录不存在时先 MKCOL。
+  Future<void> putText(String id, String path, String text) async {
+    final server = byId(id);
+    if (server == null) throw DavException('该 WebDAV 服务器不存在（可能已被删除）');
+    final base = normalizeDavBase(server.url);
+    final auth = davBasicAuth(server.username, server.password);
+    final client = HttpClient()..connectionTimeout = const Duration(seconds: 15);
+    try {
+      await _ensureCollections(client, base, path, auth);
+      final req = await client.openUrl('PUT', Uri.parse(davJoin(base, path)));
+      req.headers.set('Content-Type', 'application/json; charset=utf-8');
+      if (auth.isNotEmpty) {
+        req.headers.set(HttpHeaders.authorizationHeader, auth);
+      }
+      final body = utf8.encode(text);
+      req.contentLength = body.length;
+      req.add(body);
+      final res = await req.close();
+      await res.drain<void>();
+      final status = res.statusCode;
+      if (status == 401) {
+        throw DavException('认证失败（HTTP 401）：请检查用户名与密码');
+      }
+      if (status < 200 || status >= 300) {
+        throw DavException('写入同步文件失败（HTTP $status）');
+      }
+    } on DavException {
+      rethrow;
+    } on SocketException catch (e) {
+      throw DavException('连接服务器失败：${e.message}');
+    } on HttpException catch (e) {
+      throw DavException('请求失败：${e.message}');
+    } catch (e) {
+      throw DavException('请求失败：$e');
+    } finally {
+      client.close(force: true);
+    }
+  }
+
+  /// 逐级创建父集合（已存在时服务器回 405，忽略即可）。
+  Future<void> _ensureCollections(
+    HttpClient client,
+    String base,
+    String path,
+    String auth,
+  ) async {
+    final segments = path
+        .split('/')
+        .map((e) => e.trim())
+        .where((e) => e.isNotEmpty)
+        .toList();
+    if (segments.length < 2) return;
+    for (var i = 1; i < segments.length; i++) {
+      final dir = '/${segments.take(i).join('/')}';
+      try {
+        final req = await client.openUrl(
+          'MKCOL',
+          Uri.parse(davJoin(base, dir)),
+        );
+        if (auth.isNotEmpty) {
+          req.headers.set(HttpHeaders.authorizationHeader, auth);
+        }
+        req.contentLength = 0;
+        final res = await req.close();
+        await res.drain<void>();
+      } catch (_) {
+        // 单级创建失败（多半是已存在）不阻断后续 PUT；真正失败由 PUT 报错。
+      }
+    }
   }
 
   /// 列目录（path 省略 = 根）。

@@ -1,16 +1,22 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
 
 import 'package:path/path.dart' as p;
 
+import '../../core/errors/app_error.dart';
 import '../../core/logging/app_log.dart';
 import '../../core/logging/log_redact.dart';
 import '../drive/baidu_native.dart';
+import '../live/live_ua_policy.dart';
 import '../drive/drive_descriptor.dart';
 import '../drive/uc_native.dart';
+import '../spider_debug/spider_debug_service.dart';
 import '../torrent/bt_stream.dart';
 import 'm3u8_purify.dart';
+import 'relay_access.dart';
+import 'relay_origin.dart';
 import 'stream_cache_io.dart';
 
 /// 本地 9978 中继：`/play` / `/file` / `/pkg` / `/img` / `/bt` / `/proxy?do=live`。
@@ -64,6 +70,17 @@ class LocalRelay {
   int _playHeaderSeq = 0;
   static const _playHeaderMax = 400;
 
+  /// 播放期 Cookie 会话：provider → (cookie 名 → `name=value`)。
+  ///
+  /// 网盘会话中途刷新（夸克 / UC 的 `__puus`）只出现在上游 `Set-Cookie` 里。
+  /// 记录后供同一 provider 的后续清单 / 分片请求复用；401 / 403 时先用
+  /// 刷新后的 Cookie 重试一次，仍失败才把错误透传给播放器。
+  final Map<String, Map<String, String>> _playCookieJar = {};
+  static const _playCookieMax = 20;
+
+  /// 最多记忆多少个 provider，避免任意 `ck=` 参数把会话表撑大。
+  static const _playCookieProvidersMax = 32;
+
   /// 超长目标地址同样换成短 token（`p=h1`），避免超过 FFmpeg 的 URL 上限。
   ///
   /// 普通短视频地址仍用 `url=`，日志和排查更直观；只有编码后超过
@@ -77,6 +94,22 @@ class LocalRelay {
   bool get running => _server != null;
   int get port => _port;
   String get baseUrl => 'http://127.0.0.1:$_port';
+
+  /// 本进程的随机访问令牌。
+  ///
+  /// 浏览器发起的请求必须带 `?rt=<token>`（见 [RelayAccessPolicy]）；
+  /// 原生播放器 / 壳内 JVM 不发 `Origin`/`Sec-Fetch-*`，不受影响。
+  /// 令牌只在内存里，不落盘、不写日志。
+  final String accessToken = _newAccessToken();
+
+  static String _newAccessToken() {
+    final random = Random.secure();
+    final bytes = List<int>.generate(18, (_) => random.nextInt(256));
+    return base64Url.encode(bytes).replaceAll('=', '');
+  }
+
+  /// 蜘蛛调试服务：桌面端在 main 里注入；未注入或未开启时 `/debug/spider` 返回 403。
+  SpiderDebugService? debugService;
 
   Future<void> start({
     required String fileRoot,
@@ -107,6 +140,9 @@ class LocalRelay {
             enabled: cacheEnabled ?? () => false,
             limitMb: cacheLimitMb ?? () => 1024,
           );
+    // 启动后后台扫一遍缓存目录（设置页统计 / LRU 淘汰都靠它）。
+    // 以前这一步压在首个分片请求上，历史缓存多时会把起播拖住。
+    if (cacheEnabled?.call() == true) _streamCache?.warmUp();
     _externalEpisodeResolver = externalEpisodeResolver;
     _client = HttpClient()
       ..connectionTimeout = const Duration(seconds: 15)
@@ -131,6 +167,13 @@ class LocalRelay {
   /// 边播边缓存当前占用字节数（设置页展示 / 清空前确认用）。
   Future<int> streamCacheBytes() async => await _streamCache?.totalBytes() ?? 0;
 
+  /// 边播缓存的条目数（下载管理页展示用）。
+  Future<int> streamCacheEntryCount() async =>
+      await _streamCache?.entryCount() ?? 0;
+
+  /// 边播缓存的磁盘目录（播放器「下载视频」复用它，空 = 未启用）。
+  String get streamCacheDir => _streamCache?.dir ?? '';
+
   /// 清空边播缓存目录。
   Future<void> clearStreamCache() async {
     await _streamCache?.clear();
@@ -144,6 +187,7 @@ class LocalRelay {
     _playHeaderTokens.clear();
     _playTargets.clear();
     _playTargetTokens.clear();
+    _playCookieJar.clear();
     _streamCache = null;
     try {
       await server?.close(force: true);
@@ -162,6 +206,18 @@ class LocalRelay {
     }
     _client = null;
     _insecureClient = null;
+  }
+
+  /// 网盘登录态变化时清掉该 provider 的播放期 Cookie。
+  ///
+  /// 换账号 / 重新扫码后旧账号的 `__puus` 仍在 jar 里，会覆盖新账号刚注入的
+  /// Cookie；清掉后由新会话重新学习。
+  void clearPlaySession([String? provider]) {
+    if (provider == null || provider.isEmpty) {
+      _playCookieJar.clear();
+    } else {
+      _playCookieJar.remove(provider);
+    }
   }
 
   String playUrl(
@@ -226,33 +282,94 @@ class LocalRelay {
 
   Future<void> _handle(HttpRequest request) async {
     final res = request.response;
-    res.headers.set('Access-Control-Allow-Origin', '*');
-    res.headers.set('Access-Control-Allow-Headers', '*');
-    res.headers.set('Access-Control-Allow-Methods', 'GET,HEAD,OPTIONS');
+    final path = request.uri.path;
+    // 浏览器跨站访问只对媒体路由开口子：`/file` 与 `/pkg` 能读应用数据目录
+    // （网盘 Cookie 落盘文件在其中），`/proxy` 能借中继的凭据代取任意地址，
+    // 这两类不能靠 `Access-Control-Allow-Origin: *` 暴露给任意网页。
+    final originHeader = request.headers.value('origin');
+    final secFetchSite = request.headers.value('sec-fetch-site');
+    final secFetchMode = request.headers.value('sec-fetch-mode');
+    // 浏览器请求先过令牌：DNS rebinding 能让「Origin == Host」成立，
+    // 只靠 CORS 同源判断挡不住敏感路由。令牌在内存里，原生客户端不需要。
+    final browserRequest = RelayAccessPolicy.isBrowserRequest(
+      origin: originHeader,
+      secFetchSite: secFetchSite,
+      secFetchMode: secFetchMode,
+    );
+    if (browserRequest) {
+      final provided = request.uri.queryParameters['rt'];
+      if (!RelayAccessPolicy.tokenMatches(accessToken, provided)) {
+        AppLog.w(
+          'relay',
+          '拒绝未授权浏览器请求 ${request.method} $path origin=$originHeader',
+        );
+        res.headers.set('Vary', 'Origin');
+        return _text(res, 403, '需要访问令牌');
+      }
+    }
+    final verdict = RelayOriginPolicy.evaluate(
+      path: path,
+      origin: originHeader,
+      host: request.headers.value(HttpHeaders.hostHeader),
+      secFetchSite: secFetchSite,
+    );
+    if (verdict == RelayOriginVerdict.crossSiteDenied) {
+      AppLog.w('relay', '拒绝跨站访问 ${request.method} $path origin=$originHeader');
+      res.headers.set('Vary', 'Origin');
+      return _text(res, 403, '跨站访问被拒绝');
+    }
+    // 只对确实带 Origin 的请求回写 CORS：逐条回显来源而不是 `*`，
+    // 这样第三方页面读不到响应体，同源页面（含 Web 版界面）不受影响。
+    final self = RelayOriginPolicy.normalizeOrigin(originHeader);
+    if (self != null) {
+      res.headers.set('Access-Control-Allow-Origin', originHeader!.trim());
+      res.headers.set('Vary', 'Origin');
+      res.headers.set('Access-Control-Allow-Headers', '*');
+      res.headers.set('Access-Control-Allow-Methods', kRelayAllowMethods);
+    } else if (verdict == RelayOriginVerdict.allow) {
+      // 原生客户端不需要 CORS 头；中继自己的 Web 版界面走不到这里（Web 版 baseUrl 为空）。
+      res.headers.set('Access-Control-Allow-Methods', kRelayAllowMethods);
+    }
     if (request.method == 'OPTIONS') {
       res.statusCode = 204;
       await res.close();
       return;
     }
-    final path = request.uri.path;
     try {
       // /play、/proxy 的分片请求量很大，只在清单/失败时记录；其余路由逐条记。
       if (path != '/play' && path != '/proxy' && !path.startsWith('/proxy/')) {
         AppLog.i('relay', '${request.method} $path');
       }
-      if (path == '/play') return await _handlePlay(request);
+      if (path == '/play') {
+        return await _handlePlay(request, guardPrivate: browserRequest);
+      }
       if (path == '/file' || path.startsWith('/file/')) {
         return await _handleFile(request);
+      }
+      // 本地媒体库：按绝对路径取文件。只允许原生客户端（浏览器请求一律拒绝，
+      // 否则任意网页都能借中继读取本机磁盘上的视频/文件）。
+      if (path == '/media') {
+        if (browserRequest) {
+          return await _text(res, 403, '媒体文件只允许本机播放器访问');
+        }
+        return await _handleMedia(request);
       }
       if (path == '/pkg' || path.startsWith('/pkg/')) {
         return await _handlePkg(request);
       }
-      if (path == '/img') return await _handleImg(request);
+      if (path == '/img') {
+        return await _handleImg(request, guardPrivate: browserRequest);
+      }
       if (path.startsWith('/ext/')) {
         return await _handleExternalEpisode(request);
       }
       if (path.startsWith('/bt/')) return await _handleBt(request);
-      if (path == '/proxy') return await _handleLiveProxy(request);
+      if (path == '/debug/spider' || path.startsWith('/debug/spider/')) {
+        return await _handleSpiderDebug(request);
+      }
+      if (path == '/proxy') {
+        return await _handleLiveProxy(request, guardPrivate: browserRequest);
+      }
       if (path.startsWith('/proxy/')) {
         return await _handleJvmProxyPath(request);
       }
@@ -261,7 +378,7 @@ class LocalRelay {
     } catch (e, s) {
       AppLog.e('relay', '$path 处理失败', e, s);
       try {
-        return await _text(res, 502, '中继失败：$e');
+        return await _text(res, 502, '中继失败：${describeAppError(e).title}');
       } catch (_) {
         try {
           await res.close();
@@ -270,7 +387,10 @@ class LocalRelay {
     }
   }
 
-  Future<void> _handlePlay(HttpRequest request) async {
+  Future<void> _handlePlay(
+    HttpRequest request, {
+    bool guardPrivate = false,
+  }) async {
     final res = request.response;
     final query = request.uri.queryParameters;
     var target = (query['url'] ?? query['u'] ?? '').trim();
@@ -281,6 +401,9 @@ class LocalRelay {
     if (target.isEmpty) return _text(res, 400, '缺少 url');
     if (!RegExp(r'^https?://', caseSensitive: false).hasMatch(target)) {
       return _text(res, 400, '只支持 http(s) 播放地址');
+    }
+    if (guardPrivate && RelayAccessPolicy.isPrivateTarget(target)) {
+      return _text(res, 403, '禁止访问本机/内网地址');
     }
     final provider = (query['ck'] ?? '').trim();
     final headers = _headersFromQuery(query, provider);
@@ -333,6 +456,17 @@ class LocalRelay {
       final auth = _davAuth(davId);
       if (auth.isNotEmpty) headers['Authorization'] = auth;
     }
+    // 网盘会话 Cookie：账号 Cookie 在 _headersFromQuery 里注入，这里再叠加
+    // 播放期从上游 Set-Cookie 学到的新 Cookie（同名以新值覆盖）。
+    if (provider.isNotEmpty) {
+      final merged = _applyPlayCookieJar(
+        provider,
+        _headerValue(headers, HttpHeaders.cookieHeader),
+      );
+      if (merged.isNotEmpty) {
+        _setHeader(headers, HttpHeaders.cookieHeader, merged);
+      }
+    }
     final range = request.headers.value(HttpHeaders.rangeHeader);
     // 边播边缓存：命中直接读盘，连上游都不碰 —— 拖回看过的位置不再回源。
     final cacheKey = StreamDiskCache.keyOf(target);
@@ -350,24 +484,82 @@ class LocalRelay {
       }
     }
 
-    final upstream = await _open(
+    // ★ 网盘 CDN 的「跨度限速」：开放区间（`bytes=0-`）与超大跨度会让同一节点
+    //   被压到 ~0.1 MB/s，播放器表现为「有画面但极慢」。夹到 32MB 后回到
+    //   10~19 MB/s；上游回 206 + 真实 Content-Range，播放器会自然续请求下一段。
+    //   只对夸克 / UC / 百度生效，避免影响 WebDAV、B 站等无关线路。
+    final opened = await _openPlayWithSession(
       target,
       headers: headers,
       method: request.method,
-      range: range,
+      range: _shouldClampRange(provider, target) ? clampRange(range) : range,
+      provider: provider,
     );
-    final finalUrl = _finalUrl(upstream, target);
+    final upstream = opened.response;
+    // 上游可能下发了刷新后的会话 Cookie；清单里的子地址要用最新 Cookie，
+    // 否则后续分片仍带旧值，播一会儿就 401 / 403 断流。
+    if (provider.isNotEmpty) {
+      final merged = _applyPlayCookieJar(
+        provider,
+        _headerValue(headers, HttpHeaders.cookieHeader),
+      );
+      if (merged.isNotEmpty) {
+        _setHeader(headers, HttpHeaders.cookieHeader, merged);
+      }
+    }
+    final finalUrl = opened.finalUrl;
+    if (guardPrivate && RelayAccessPolicy.isPrivateTarget(finalUrl)) {
+      // 上游 30x 到内网同样要拦：只检查入口地址绕不过重定向。
+      await upstream.drain<void>();
+      return _text(res, 403, '禁止访问本机/内网地址');
+    }
     final contentType = _responseContentType(upstream);
     final looksM3u8 =
         finalUrl.toLowerCase().contains('.m3u8') ||
         contentType.contains('mpegurl') ||
         contentType.contains('application/vnd.apple');
+    // B 站（以及不少 DASH 源）下发的是 DASH 清单：content-type 为
+    // application/dash+xml，正文是 <MPD>，分片地址在 <BaseURL> 里且同样受
+    // Referer / UA 校验。不识别它时清单会原样透传，播放器拿到的 BaseURL 指向
+    // bilivideo CDN、却没有中继注入的 Referer，于是 403 —— 用户侧表现为
+    // 「能打开但一直转圈 / invalid or unsupported media」。
+    // 实测：wex 系 BiliGuard（高中课堂 / 少儿教育）返回的正是
+    // /proxy?do=bili&...&type=mpd 且 format=application/dash+xml。
+    final looksDash =
+        contentType.contains('dash+xml') ||
+        finalUrl.toLowerCase().contains('.mpd');
 
-    if (looksM3u8) {
+    if (looksM3u8 || looksDash) {
       AppLog.i(
         'relay',
-        '/play m3u8 ${upstream.statusCode} ${redactUrl(target)}',
+        '/play ${looksDash ? 'mpd' : 'm3u8'} ${upstream.statusCode} '
+            '${redactUrl(target)}',
       );
+    }
+    if (looksDash && request.method != 'HEAD' && upstream.statusCode < 400) {
+      // DASH 不复用 m3u8 的 _rewritePlaylist（它按 #EXT-X-* 行处理），只改写
+      // <BaseURL> 与 SegmentTemplate 的 media/initialization 里的绝对地址。
+      var bytes = await _readLimited(upstream);
+      final encoding = _responseHeader(
+        upstream,
+        HttpHeaders.contentEncodingHeader,
+      ).toLowerCase();
+      if (encoding.contains('gzip')) {
+        try {
+          bytes = gzip.decode(bytes);
+        } catch (_) {
+          // 解压失败按原文处理
+        }
+      }
+      final text = utf8.decode(bytes, allowMalformed: true);
+      final rewritten = _rewriteMpd(text, finalUrl, headers, provider);
+      res.statusCode = 200;
+      res.headers.set('content-type', 'application/dash+xml');
+      final payload = utf8.encode(rewritten);
+      res.headers.contentLength = payload.length;
+      res.add(payload);
+      await res.close();
+      return;
     }
     if (looksM3u8 && request.method != 'HEAD' && upstream.statusCode < 400) {
       var bytes = await _readLimited(upstream);
@@ -435,10 +627,19 @@ class LocalRelay {
       return;
     }
     try {
-      await for (final chunk in upstream) {
-        res.add(chunk);
-        writer.add(chunk);
-      }
+      // 用 addStream 转发，而不是 res.add 的裸循环：
+      // addStream 会把播放器的读取背压一路传回上游，缓存开启时也不会
+      // 把整段分片先读进内存再排队（内存抖动会表现成播放卡顿）。
+      await res.addStream(
+        upstream.transform(
+          StreamTransformer<List<int>, List<int>>.fromHandlers(
+            handleData: (chunk, sink) {
+              writer.add(chunk);
+              sink.add(chunk);
+            },
+          ),
+        ),
+      );
       await res.close();
       await writer.commit();
     } catch (_) {
@@ -448,6 +649,63 @@ class LocalRelay {
         await res.close();
       } catch (_) {}
     }
+  }
+
+  /// 单次上游请求的 Range 跨度上限（32MB）。
+  ///
+  /// 实测（夸克 672MB / 2GB 两个直链，同一 cookie、同一节点）：
+  ///   · `bytes=0-`（开放）→ 0.1 MB/s
+  ///   · 跨度 2GB / 1GB / 512MB → 0.1 MB/s
+  ///   · 跨度 400MB / 350MB → 0.1 / 4.6 MB/s（阈值在 ~360MB 附近）
+  ///   · 跨度 300MB / 256MB → 5.4 / 7.8 MB/s
+  ///   · 跨度 128MB / 64MB / 32MB → 9.8 / 9.6 / 13.0 MB/s
+  ///   · 跨度 16MB / 8MB → 8.5 / 19.2 MB/s
+  /// 也就是说速度与请求跨度反相关，开放 Range 是最差的一种。
+  /// 播放器（尤其 fvp / mpv）开场习惯发 `bytes=0-`，正好踩在这个坑上。
+  static const int _maxUpstreamRangeBytes = 32 * 1024 * 1024;
+
+  /// 该线路是否是会出现「跨度限速」的网盘 CDN。
+  ///
+  /// 只对夸克 / UC / 百度夹取：普通 HTTP 直链、WebDAV、B 站 CDN 没有这个
+  /// 问题，没必要把一次长请求拆成几十段。provider 缺失时按 host 兜底
+  /// （壳的 `do=pan` 有时不带 `site` 参数）。
+  static bool _shouldClampRange(String provider, String target) {
+    final p = provider.toLowerCase().trim();
+    if (p.startsWith('quark') || p.startsWith('uc') || p.startsWith('baidu')) {
+      return true;
+    }
+    final host = Uri.tryParse(target)?.host.toLowerCase() ?? '';
+    if (host.isEmpty) return false;
+    return host.contains('quark.cn') ||
+        host.contains('uc.cn') ||
+        host.contains('ucweb.com') ||
+        host.contains('baidupcs.com') ||
+        host.contains('bcebos.com') ||
+        host.contains('baidu.com');
+  }
+
+  /// 把播放器的 Range 夹到安全跨度；无法解析时原样透传（不猜）。
+  ///
+  /// 只处理单区间 `bytes=<start>-<end|*>`：多区间（带逗号）与 `-<suffix>` 形态
+  /// 直接透传 —— 那些在媒体播放里几乎不出现，改动它们风险大于收益。
+  static String? clampRange(String? range) {
+    if (range == null || range.trim().isEmpty) return range;
+    final m = RegExp(
+      r'^bytes\s*=\s*(\d+)\s*-\s*(\d*)$',
+      caseSensitive: false,
+    ).firstMatch(range.trim());
+    if (m == null) return range;
+    final start = int.tryParse(m.group(1)!);
+    if (start == null || start < 0) return range;
+    final endText = m.group(2)!.trim();
+    if (endText.isEmpty) {
+      // 开放区间：夹成固定跨度
+      return 'bytes=$start-${start + _maxUpstreamRangeBytes - 1}';
+    }
+    final end = int.tryParse(endText);
+    if (end == null || end < start) return range;
+    if (end - start + 1 <= _maxUpstreamRangeBytes) return range;
+    return 'bytes=$start-${start + _maxUpstreamRangeBytes - 1}';
   }
 
   /// 只把音视频 / 图片 / 二进制当作可缓存内容，避免把 HTML 错误页写进缓存。
@@ -466,6 +724,18 @@ class LocalRelay {
     final raw = request.uri.path.substring('/file'.length);
     final relative = _decodeRel(raw);
     await _serveFile(request, _fileRoot, relative);
+  }
+
+  /// 本地媒体库直取（绝对路径，仅原生客户端可访问）。
+  Future<void> _handleMedia(HttpRequest request) async {
+    final res = request.response;
+    final raw = (request.uri.queryParameters['path'] ?? '').trim();
+    if (raw.isEmpty) return _text(res, 400, '缺少 path 参数');
+    if (!p.isAbsolute(raw)) return _text(res, 400, '路径必须是绝对路径');
+    final filePath = p.normalize(raw);
+    final file = File(filePath);
+    if (!file.existsSync()) return _text(res, 404, '文件不存在');
+    await _serveFile(request, file.parent.path, p.basename(filePath));
   }
 
   Future<void> _handlePkg(HttpRequest request) async {
@@ -671,13 +941,19 @@ class LocalRelay {
     return (start, end >= total ? total - 1 : end);
   }
 
-  Future<void> _handleImg(HttpRequest request) async {
+  Future<void> _handleImg(
+    HttpRequest request, {
+    bool guardPrivate = false,
+  }) async {
     final res = request.response;
     final query = request.uri.queryParameters;
     final target = (query['url'] ?? query['u'] ?? '').trim();
     if (target.isEmpty) return _text(res, 400, '缺少 url');
     if (!RegExp(r'^https?://', caseSensitive: false).hasMatch(target)) {
       return _text(res, 400, '只支持 http(s) 图片地址');
+    }
+    if (guardPrivate && RelayAccessPolicy.isPrivateTarget(target)) {
+      return _text(res, 403, '禁止访问本机/内网地址');
     }
     final headers = <String, String>{
       'User-Agent':
@@ -688,20 +964,18 @@ class LocalRelay {
     };
     // 代理链路抖动时（隧道被对端掐断、节点瞬断）重试一次再放弃：
     // 封面是并发拉取的，偶发失败在界面上就是「有个别封面不出来」。
-    HttpClientResponse upstream;
+    ({HttpClientResponse response, String finalUrl}) opened;
     try {
-      upstream = await _open(
-        target,
-        headers: headers,
-        method: request.method,
-      );
+      opened = await _open(target, headers: headers, method: request.method);
     } catch (_) {
       await Future<void>.delayed(const Duration(milliseconds: 120));
-      upstream = await _open(
-        target,
-        headers: headers,
-        method: request.method,
-      );
+      opened = await _open(target, headers: headers, method: request.method);
+    }
+    final upstream = opened.response;
+    if (guardPrivate &&
+        RelayAccessPolicy.isPrivateTarget(opened.finalUrl)) {
+      await upstream.drain<void>();
+      return _text(res, 403, '禁止访问本机/内网地址');
     }
     res.statusCode = upstream.statusCode;
     _copyHeader(upstream, res, HttpHeaders.contentTypeHeader);
@@ -713,7 +987,91 @@ class LocalRelay {
     await upstream.pipe(res);
   }
 
-  Future<void> _handleLiveProxy(HttpRequest request) async {
+  /// 蜘蛛调试口：`/debug/spider`。
+  ///
+  /// 默认关闭（[SpiderDebugService.enabled]），关闭时一律 403 —— 这个路由能
+  /// 执行任意蜘蛛脚本，不能因为「本机」就默认敞开。跨站请求已在 `_handle`
+  /// 里按敏感路由拒绝（HTTPS 页面的跨站请求拦不住，同理任何未授权调用）。
+  Future<void> _handleSpiderDebug(HttpRequest request) async {
+    final res = request.response;
+    final service = debugService;
+    if (service == null || !service.enabled) {
+      return await _debugJson(res, 403, {'error': '蜘蛛调试未开启'});
+    }
+    final rest = request.uri.path.substring('/debug/spider'.length);
+    try {
+      if (request.method == 'POST' && rest == '/session') {
+        final session = service.create();
+        return await _debugJson(res, 200, {'session': session.id});
+      }
+      final session = service.find(request.uri.queryParameters['session']);
+      if (session == null) {
+        return await _debugJson(res, 401, {'error': '调试会话不存在或已过期'});
+      }
+      if (request.method == 'DELETE') {
+        service.remove(session.id);
+        return await _debugJson(res, 200, session.snapshot().toJson());
+      }
+      if (request.method == 'GET') {
+        return await _debugJson(res, 200, session.snapshot().toJson());
+      }
+      if (request.method == 'POST' && rest == '/cancel') {
+        return await _debugJson(res, 200, session.cancel().toJson());
+      }
+      if (request.method == 'POST' && rest.isEmpty) {
+        final raw = await utf8.decodeStream(request);
+        if (raw.length > 64 * 1024) {
+          return await _debugJson(res, 413, {'error': '请求体过大'});
+        }
+        Map<String, dynamic> body;
+        try {
+          final decoded = jsonDecode(raw);
+          if (decoded is! Map) throw const FormatException('需要 JSON 对象');
+          body = Map<String, dynamic>.from(decoded);
+        } catch (e) {
+          return await _debugJson(res, 400, {'error': '请求体不是有效 JSON：$e'});
+        }
+        final parsed = parseSpiderDebugRequest(body);
+        final runner = _spiderDebugRunner;
+        if (runner == null) {
+          return await _debugJson(res, 503, {'error': '调试执行器未就绪'});
+        }
+        final snapshot = await session.run(
+          runner: runner,
+          method: parsed.method,
+          args: parsed.args,
+          timeout: parsed.timeout,
+        );
+        return await _debugJson(res, 200, snapshot.toJson());
+      }
+      return await _debugJson(res, 404, {'error': '未知的调试路由'});
+    } on SpiderDebugException catch (e) {
+      return await _debugJson(res, 409, {'error': e.message});
+    }
+  }
+
+  /// 调试执行器（由 main 注入，实际调用 SourceService）。
+  SpiderDebugRunner? _spiderDebugRunner;
+
+  set spiderDebugRunner(SpiderDebugRunner? runner) =>
+      _spiderDebugRunner = runner;
+
+  Future<void> _debugJson(
+    HttpResponse res,
+    int status,
+    Map<String, dynamic> body,
+  ) async {
+    res.statusCode = status;
+    res.headers.set('content-type', 'application/json; charset=utf-8');
+    res.headers.set('cache-control', 'no-store');
+    res.add(utf8.encode(jsonEncode(body)));
+    await res.close();
+  }
+
+  Future<void> _handleLiveProxy(
+    HttpRequest request, {
+    bool guardPrivate = false,
+  }) async {
     final res = request.response;
     final query = request.uri.queryParameters;
     final doValue = (query['do'] ?? '').trim().toLowerCase();
@@ -726,7 +1084,7 @@ class LocalRelay {
     if (doValue == 'pan') return _handlePanProxy(request);
     // 通用宿主代理：`do=proxy` / `do=url` / `do=img`（老 TVBox 宿主约定）。
     if (doValue == 'proxy' || doValue == 'url' || doValue == 'img') {
-      return _handleUrlProxy(request);
+      return _handleUrlProxy(request, guardPrivate: guardPrivate);
     }
     if (doValue != 'live') {
       // 壳自己的宿主路由（如 `do=hmys`）依赖该 JVM 内存里的状态（Cookie / 密钥 /
@@ -738,7 +1096,7 @@ class LocalRelay {
       // 其它宿主路由（`do=py` / `do=hxq` 等）：只要有可转发的 url 就按通用代理处理，
       // 否则明确报错，避免壳拿到 404/400 后误判成空结果。
       if ((query['url'] ?? query['u'] ?? '').trim().isNotEmpty) {
-        return _handleUrlProxy(request);
+        return _handleUrlProxy(request, guardPrivate: guardPrivate);
       }
       return _text(res, 400, 'do=$doValue 未实现（可用的 do=live/pan/proxy）');
     }
@@ -750,11 +1108,24 @@ class LocalRelay {
     if (!RegExp(r'^https?://', caseSensitive: false).hasMatch(target)) {
       return _text(res, 400, '直播订阅地址无效');
     }
-    final upstream = await _open(
+    if (guardPrivate && RelayAccessPolicy.isPrivateTarget(target)) {
+      return _text(res, 403, '禁止访问本机/内网地址');
+    }
+    // 用户为某个直播接口指定的 UA 同样适用于壳/蜘蛛经宿主代理取的这份直播单；
+    // 只有**命中的接口规则**才覆盖，全局默认 UA 不动这里 —— 壳系的
+    // TVBoxWin/0.1 是上游约定，换成别的可能直接取不到单。
+    final ruleUa = LiveUaPolicy.current.matchRule(target);
+    final opened = await _open(
       target,
-      headers: {'User-Agent': 'Mozilla/5.0 TVBoxWin/0.1'},
+      headers: {'User-Agent': ruleUa ?? 'Mozilla/5.0 TVBoxWin/0.1'},
       method: request.method,
     );
+    final upstream = opened.response;
+    if (guardPrivate &&
+        RelayAccessPolicy.isPrivateTarget(opened.finalUrl)) {
+      await upstream.drain<void>();
+      return _text(res, 403, '禁止访问本机/内网地址');
+    }
     res.statusCode = upstream.statusCode;
     _copyHeader(upstream, res, HttpHeaders.contentTypeHeader);
     _copyHeader(upstream, res, HttpHeaders.contentLengthHeader);
@@ -800,12 +1171,12 @@ class LocalRelay {
       final value = request.headers.value(name);
       if (value != null && value.isNotEmpty) headers[name] = value;
     }
-    final upstream = await _open(
+    final upstream = (await _open(
       target,
       headers: headers,
       method: request.method,
       range: request.headers.value(HttpHeaders.rangeHeader),
-    );
+    )).response;
     res.statusCode = upstream.statusCode;
     _copyHeader(upstream, res, HttpHeaders.contentTypeHeader);
     _copyHeader(upstream, res, HttpHeaders.contentLengthHeader);
@@ -880,43 +1251,64 @@ class LocalRelay {
         headers[HttpHeaders.refererHeader] = 'https://pan.baidu.com/';
       }
     }
-    await _streamTarget(request, link.url, headers);
+    await _streamTarget(request, link.url, headers, provider: provider);
   }
 
   /// 通用宿主代理 `do=proxy` / `do=url` / `do=img`：按 `url` 原样转发。
-  Future<void> _handleUrlProxy(HttpRequest request) async {
+  Future<void> _handleUrlProxy(
+    HttpRequest request, {
+    bool guardPrivate = false,
+  }) async {
     final res = request.response;
     final q = request.uri.queryParameters;
     final target = (q['url'] ?? q['u'] ?? q['target'] ?? '').trim();
     if (!RegExp(r'^https?://', caseSensitive: false).hasMatch(target)) {
       return _text(res, 400, 'do=${q['do']} 缺少合法的 url');
     }
-    final headers = _headersFromQuery(
-      q,
-      (q['ck'] ?? q['provider'] ?? '').trim(),
-    );
+    if (guardPrivate && RelayAccessPolicy.isPrivateTarget(target)) {
+      return _text(res, 403, '禁止访问本机/内网地址');
+    }
+    final provider = (q['ck'] ?? q['provider'] ?? '').trim();
+    final headers = _headersFromQuery(q, provider);
     if (_headerValue(headers, HttpHeaders.userAgentHeader).isEmpty) {
       headers[HttpHeaders.userAgentHeader] =
           'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
           'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
     }
-    await _streamTarget(request, target, headers);
+    await _streamTarget(
+      request,
+      target,
+      headers,
+      guardPrivate: guardPrivate,
+      provider: provider,
+    );
   }
 
   /// 把目标地址按 Range 透传给播放器（统一补 Content-Type/Length 等）。
+  ///
+  /// 网盘 CDN 的跨度限速对这条路径同样生效：`do=pan` 解出来的百度 / UC / 夸克
+  /// 直链会经这里拉流，所以与 `/play` 用同一套夹取规则（仅限网盘线路）。
   Future<void> _streamTarget(
     HttpRequest request,
     String target,
-    Map<String, String> headers,
-  ) async {
+    Map<String, String> headers, {
+    bool guardPrivate = false,
+    String provider = '',
+  }) async {
     final res = request.response;
     final range = request.headers.value(HttpHeaders.rangeHeader);
-    final upstream = await _open(
+    final opened = await _open(
       target,
       headers: headers,
       method: request.method,
-      range: range,
+      range: _shouldClampRange(provider, target) ? clampRange(range) : range,
     );
+    final upstream = opened.response;
+    if (guardPrivate &&
+        RelayAccessPolicy.isPrivateTarget(opened.finalUrl)) {
+      await upstream.drain<void>();
+      return _text(res, 403, '禁止访问本机/内网地址');
+    }
     res.statusCode = upstream.statusCode;
     _copyHeader(upstream, res, HttpHeaders.contentTypeHeader);
     _copyHeader(upstream, res, HttpHeaders.contentLengthHeader);
@@ -989,6 +1381,13 @@ class LocalRelay {
     return '';
   }
 
+  /// 大小写不敏感地覆盖请求头，避免 `Cookie` / `cookie` 同时存在。
+  void _setHeader(Map<String, String> headers, String name, String value) {
+    final lower = name.toLowerCase();
+    headers.removeWhere((key, _) => key.toLowerCase() == lower);
+    headers[name] = value;
+  }
+
   Map<String, String> _headersFromQuery(
     Map<String, String> query,
     String provider,
@@ -1038,7 +1437,7 @@ class LocalRelay {
     return headers;
   }
 
-  Future<HttpClientResponse> _open(
+  Future<({HttpClientResponse response, String finalUrl})> _open(
     String url, {
     required Map<String, String> headers,
     required String method,
@@ -1048,17 +1447,15 @@ class LocalRelay {
       ..connectionTimeout = const Duration(seconds: 15)
       ..autoUncompress = false;
 
-    Future<HttpClientResponse> send(HttpClient targetClient) async {
-      final req = await targetClient.openUrl(method, Uri.parse(url));
-      req.headers.set(HttpHeaders.acceptEncodingHeader, 'identity');
-      headers.forEach((key, value) => req.headers.set(key, value));
-      if (range != null && range.isNotEmpty) {
-        req.headers.set(HttpHeaders.rangeHeader, range);
-      }
-      req.followRedirects = true;
-      req.maxRedirects = 5;
-      return req.close();
-    }
+    Future<({HttpClientResponse response, String finalUrl})> send(
+      HttpClient targetClient,
+    ) => _openFollow(
+      targetClient,
+      url: url,
+      headers: headers,
+      method: method,
+      range: range,
+    );
 
     try {
       return await send(client);
@@ -1076,16 +1473,212 @@ class LocalRelay {
     }
   }
 
-  String _finalUrl(HttpClientResponse response, String original) {
-    var url = original;
-    for (final redirect in response.redirects) {
-      try {
-        url = Uri.parse(url).resolve(redirect.location.toString()).toString();
-      } catch (_) {
-        url = redirect.location.toString();
+  /// 手动跟随重定向，并返回最终落地的 URL。
+  ///
+  /// ★ 不能依赖 Dart 的 `followRedirects`：它跟随 302 时会新建请求，而新建
+  ///   请求已经带了默认 `User-Agent: Dart/x.y`，复制逻辑规定「新请求已有该头
+  ///   就不复制」，于是调用方设置的 UA 被静默换掉。百度 dlink 的 302 目标
+  ///   （`*.baidupcs.com`）正是按 UA 判防盗链，UA 一丢就恒定 403，播放器侧
+  ///   只报 `invalid or unsupported media`。
+  ///
+  /// 每一跳都保留 User-Agent / Range / Referer（防盗链判定依据）；跨源时
+  /// 丢弃 Cookie / Authorization 等账号凭据。最多 5 跳，与原 `maxRedirects` 一致。
+  Future<({HttpClientResponse response, String finalUrl})> _openFollow(
+    HttpClient targetClient, {
+    required String url,
+    required Map<String, String> headers,
+    required String method,
+    String? range,
+  }) async {
+    final original = Uri.parse(url);
+    var current = original;
+    for (var hop = 0; hop <= 5; hop++) {
+      final req = await targetClient.openUrl(method, current);
+      final crossOrigin = !_isSameOrigin(original, current);
+      req.headers.set(HttpHeaders.acceptEncodingHeader, 'identity');
+      headers.forEach((key, value) {
+        if (crossOrigin && _isSensitiveHeaderOnRedirect(key)) return;
+        req.headers.set(key, value);
+      });
+      if (range != null && range.isNotEmpty) {
+        req.headers.set(HttpHeaders.rangeHeader, range);
+      }
+      req.followRedirects = false;
+      final response = await req.close();
+      final code = response.statusCode;
+      final location = response.headers.value(HttpHeaders.locationHeader);
+      if (code < 300 || code >= 400 || location == null || location.isEmpty) {
+        return (response: response, finalUrl: current.toString());
+      }
+      // 丢弃这一跳的响应体，避免连接悬挂
+      await response.drain<void>().catchError((Object _) {});
+      current = current.resolve(location);
+      // 只跟随 http(s)；其它协议原样交回（上层按状态码处理）
+      if (!current.isScheme('http') && !current.isScheme('https')) {
+        throw HttpException('重定向到不支持的协议：${current.scheme}');
       }
     }
-    return url;
+    throw HttpException('重定向次数过多：$url');
+  }
+
+  static bool _isSameOrigin(Uri a, Uri b) =>
+      a.isScheme(b.scheme) && a.host == b.host && a.port == b.port;
+
+  /// 跨源重定向时不能继续携带的敏感头（与 Dart 内置策略同口径）。
+  static bool _isSensitiveHeaderOnRedirect(String name) {
+    switch (name.toLowerCase()) {
+      case 'cookie':
+      case 'cookie2':
+      case 'authorization':
+      case 'proxy-authorization':
+      case 'www-authenticate':
+      case 'proxy-authenticate':
+        return true;
+    }
+    return false;
+  }
+
+  /// `/play` 的会话自愈：记录上游 `Set-Cookie`，401 / 403 时用新 Cookie 重试一次。
+  ///
+  /// 只对带 provider 的网盘源生效 —— 普通 HLS 源没有统一的 Cookie 作用域，
+  /// 按域名/地址盲目共享 Cookie 反而会把 A 站凭据发给 B 站。
+  Future<({HttpClientResponse response, String finalUrl})> _openPlayWithSession(
+    String url, {
+    required Map<String, String> headers,
+    required String method,
+    String? range,
+    required String provider,
+  }) async {
+    var opened = await _open(
+      url,
+      headers: headers,
+      method: method,
+      range: range,
+    );
+    if (provider.isEmpty) return opened;
+    _rememberPlayCookies(provider, opened.response);
+    final retryable =
+        (opened.response.statusCode == 401 ||
+            opened.response.statusCode == 403) &&
+        (method == 'GET' || method == 'HEAD');
+    if (!retryable) return opened;
+
+    final before = _headerValue(headers, HttpHeaders.cookieHeader);
+    final refreshed = _applyPlayCookieJar(provider, before);
+    if (refreshed.isEmpty || refreshed == before) {
+      AppLog.w(
+        'relay',
+        '/play ${opened.response.statusCode} 且没有可用的新 Cookie '
+            'provider=$provider url=${redactUrl(url)}',
+      );
+      return opened;
+    }
+    try {
+      await opened.response.drain<void>();
+    } catch (_) {
+      // 旧响应体丢弃失败不影响重试
+    }
+    _setHeader(headers, HttpHeaders.cookieHeader, refreshed);
+    AppLog.w(
+      'relay',
+      '/play ${opened.response.statusCode} → 用刷新后的 Cookie 重试一次 '
+          'provider=$provider',
+    );
+    opened = await _open(url, headers: headers, method: method, range: range);
+    _rememberPlayCookies(provider, opened.response);
+    return opened;
+  }
+
+  /// 记录一次上游响应里的 Set-Cookie（同名覆盖、保留最近 N 条）。
+  void _rememberPlayCookies(String provider, HttpClientResponse response) {
+    final lines = response.headers[HttpHeaders.setCookieHeader];
+    if (lines == null || lines.isEmpty) return;
+    if (!_playCookieJar.containsKey(provider) &&
+        _playCookieJar.length >= _playCookieProvidersMax) {
+      _playCookieJar.remove(_playCookieJar.keys.first);
+    }
+    final jar = _playCookieJar.putIfAbsent(provider, () => <String, String>{});
+    for (final line in lines) {
+      final pair = _cookiePairOf(line);
+      if (pair == null) continue;
+      final name = _cookieNameOf(pair);
+      if (name.isEmpty) continue;
+      final value = pair.substring(pair.indexOf('=') + 1).trim();
+      if (value.isEmpty) {
+        // 服务端删 Cookie（空值 / Max-Age=0）时同步从会话里移除。
+        jar.remove(name);
+        continue;
+      }
+      jar.remove(name);
+      jar[name] = pair;
+    }
+    while (jar.length > _playCookieMax) {
+      jar.remove(jar.keys.first);
+    }
+  }
+
+  /// 把会话 Cookie 合并进请求 Cookie：同名以会话里的新值覆盖。
+  String _applyPlayCookieJar(String provider, String cookie) {
+    final jar = _playCookieJar[provider];
+    if (jar == null || jar.isEmpty) return cookie;
+    final merged = <String, String>{};
+    for (final part in cookie.split(';')) {
+      final pair = _cookiePairOf(part);
+      if (pair == null) continue;
+      merged[_cookieNameOf(pair)] = pair;
+    }
+    for (final entry in jar.entries) {
+      merged[entry.key] = entry.value;
+    }
+    return merged.values.join('; ');
+  }
+
+  /// 取 `Set-Cookie` 的第一段 `name=value`（忽略 Path / Domain / HttpOnly 等属性）。
+  String? _cookiePairOf(String raw) {
+    final first = raw.split(';').first.trim();
+    if (first.isEmpty) return null;
+    final index = first.indexOf('=');
+    if (index <= 0) return null;
+    return first;
+  }
+
+  String _cookieNameOf(String pair) =>
+      pair.substring(0, pair.indexOf('=')).trim();
+
+  /// DASH 清单的地址改写：只动**绝对 URL**，不动相对片段名。
+  ///
+  /// MPD 与 m3u8 的结构完全不同（XML 而非逐行文本），但需求一样：清单里的
+  /// 分片地址必须换回中继，才能继续注入 Referer / UA / Cookie。B 站的
+  /// `<BaseURL>` 指向 bilivideo CDN，不带 Referer 就 403。
+  ///
+  /// 只处理三种具体形态，避免误伤 XML 属性：
+  ///   · `<BaseURL>https://…</BaseURL>`（B 站 / 常见 DASH 首选）
+  ///   · `media="https://…"` / `initialization="https://…"`（SegmentTemplate）
+  ///   · `sourceURL="https://…"`（部分封装工具）
+  /// 相对地址交给播放器按清单基址解析，改写成中继反而会破坏它。
+  String _rewriteMpd(
+    String text,
+    String baseUrl,
+    Map<String, String> headers,
+    String provider,
+  ) {
+    String wrap(String raw) {
+      final abs = _resolveRef(baseUrl, raw);
+      if (!RegExp(r'^https?://', caseSensitive: false).hasMatch(abs)) {
+        return raw;
+      }
+      return playUrl(abs, headers: headers, provider: provider);
+    }
+
+    var out = text.replaceAllMapped(
+      RegExp(r'<BaseURL>([^<]+)</BaseURL>'),
+      (m) => '<BaseURL>${wrap(m.group(1) ?? '')}</BaseURL>',
+    );
+    out = out.replaceAllMapped(
+      RegExp(r'(media|initialization|sourceURL)="([^"]+)"'),
+      (m) => '${m.group(1)}="${wrap(m.group(2) ?? '')}"',
+    );
+    return out;
   }
 
   String _rewritePlaylist(

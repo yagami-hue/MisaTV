@@ -73,6 +73,20 @@ const _nestedShortKeyMap = <String, Map<String, String>>{
     'd': 'stoken',
     'e': 'name',
   },
+  // wex 系壳（9280 那套）的百度分享用的是另一套短键，实测样本：
+  //   {"a":"271762599896626"(uk),"b":"01 4K.mkv"(name),"c":"3576627086"(shareId),
+  //    "d":"10420030909"(fs_id),"e":"vlOn10c2…"(seKey),"f":"wogg"(壳名),
+  //    "g":"STOKEN=…; BDUSS=…; BDCLND=…"(预授权 Cookie)}
+  // 补齐映射后 `extractBaiduSharedFile` 能直接命中 → 走 `_directFile` 免转存签名取链，
+  // 跳过 init→verify→分享页 那三次 HTTPS 往返（实测这段占了取链耗时的绝大部分）。
+  'baidu': <String, String>{
+    'a': 'uk',
+    'b': 'name',
+    'c': 'shareId',
+    'd': 'fs_id',
+    'e': 'seKey',
+    'g': 'cookie',
+  },
 };
 
 /// 纯 base64（兼容标准 `+/` 与 URL-safe `-_`，允许 `=` 填充）。

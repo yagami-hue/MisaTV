@@ -12,8 +12,10 @@ import '../core/net/url_utils.dart';
 import '../core/utils/json_utils.dart';
 import '../models/dav.dart';
 import '../models/drive_account.dart';
+import '../models/media_server.dart';
 import '../models/site_config.dart';
 import '../models/source_health.dart';
+import '../models/sync_settings.dart';
 import '../models/user_data.dart';
 import '../models/vod.dart';
 import '../models/xunlei_account.dart';
@@ -31,8 +33,16 @@ import '../services/drive/quark_session.dart';
 import '../services/drive/uc_session.dart';
 import '../services/artwork/artwork_service.dart';
 import '../services/jvm/jvm_runtime.dart';
+import '../services/jar_spider/spider_failure.dart';
+import '../services/jar_spider/warmup_plan.dart';
+import '../services/lan/lan_server.dart';
+import '../services/media/local_media_service.dart';
+import '../services/media/media_server_service.dart';
+import '../services/party/watch_party.dart';
+import '../services/py_spider/py_runtime.dart';
 import '../services/kazumi/kazumi_rule.dart';
 import '../services/live/epg_service.dart';
+import '../services/live/live_ua_policy.dart';
 import '../services/player/external_playlist.dart';
 import '../services/player/external_players.dart';
 import '../services/player/skip_segments.dart';
@@ -42,11 +52,17 @@ import '../services/live_service.dart';
 import '../services/local_store.dart';
 import '../services/parse/parse_service.dart';
 import '../services/play_page_unwrap.dart';
-import '../services/proxy/proxy_pool_service.dart';
 import '../services/quotes/quote_service.dart';
 import '../services/search_service.dart';
+import '../services/source_circuit_breaker.dart';
 import '../services/source_service.dart';
+import '../services/spider_debug/spider_debug_service.dart';
 import '../services/subtitle/subtitle_service.dart';
+import '../services/sync/history_sync.dart';
+import '../services/sync/sync_bundle.dart';
+import '../services/sync/sync_device.dart';
+import '../services/download/video_download_manager.dart';
+import '../services/torrent/download_manager.dart';
 import '../services/torrent/torrent_play.dart';
 import '../services/torrent/xunlei_cloud.dart';
 import '../services/webdav/dav_service.dart';
@@ -65,6 +81,35 @@ class ImportOutcome {
   final int mergedCount;
 
   int get siteCount => report.total;
+}
+
+/// 导入前的差异预览。只解析、不落盘；确认后再走 [AppState.commitImportPreview]。
+class ImportPreview {
+  const ImportPreview({
+    required this.text,
+    required this.url,
+    required this.baseUrl,
+    required this.name,
+    required this.siteCount,
+    required this.liveCount,
+    required this.added,
+    required this.removed,
+    required this.changed,
+    this.warnings = const [],
+  });
+
+  final String text;
+  final String url;
+  final String baseUrl;
+  final String name;
+  final int siteCount;
+  final int liveCount;
+  final int added;
+  final int removed;
+  final int changed;
+  final List<String> warnings;
+
+  bool get isLiveOnly => siteCount == 0 && liveCount > 0;
 }
 
 class AppException implements Exception {
@@ -108,20 +153,48 @@ class AppState extends ChangeNotifier {
   late final EpgService epgService = EpgService();
   late final DavService davService = DavService(store);
 
-  /// 免费代理池：设置页连点解锁后才显示。
-  ///
-  /// 它只记录「选中了哪个节点」，生效的代理由 [_applyEffectiveProxy] 统一决定，
-  /// 避免代理池和「网络代理」设置互相覆盖。
-  late final ProxyPoolService proxyPool = ProxyPoolService(
-    store: store,
-    onSelectionChanged: _applyEffectiveProxy,
+  /// 多端同步设置（设备名 / WebDAV 目标 / 局域网配对码）。
+  SyncSettings syncSettings = const SyncSettings();
+
+  /// Emby / Jellyfin 服务器管理。
+  late final MediaServerService mediaServers = MediaServerService(store, http);
+
+  /// 本地媒体库（扫描用户选择的文件夹）。
+  late final LocalMediaService localMedia = LocalMediaService(store);
+
+  /// aria2 下载管理器（桌面端在 main 里接入同一个 BT 引擎）。
+  final DownloadManager downloadManager = DownloadManager();
+
+  /// 播放器「下载视频」的任务管理：记录持久化，支持暂停 / 继续 / 删除。
+  late final VideoDownloadManager videoDownloads = VideoDownloadManager(
+    store,
   );
 
-  /// 代理池入口是否已解锁（设置页连点 5 次）。
-  bool proxyPoolUnlocked = false;
+  /// 局域网同步服务：给其他设备提供同步包与「一起看」房间。
+  late final LanServer lanServer = LanServer(
+    deviceName: () => syncDeviceName,
+    token: () => syncSettings.lanToken,
+    snapshot: buildSyncBundle,
+    apply: applySyncBundle,
+  );
+
+  /// 「一起看」房间状态（房主 / 观众）。
+  late final WatchPartyService watchParty = WatchPartyService(
+    deviceName: () => syncDeviceName,
+    server: () => lanServer,
+  );
+
+  /// 本机显示名：用户没填时用系统主机名。
+  String get syncDeviceName {
+    final custom = syncSettings.deviceName.trim();
+    return custom.isEmpty ? defaultSyncDeviceName() : custom;
+  }
 
   /// 磁力（BT）播放编排：桌面端在 main 里注入；Web 版为 null。
   TorrentPlay? torrentPlay;
+
+  /// 蜘蛛调试服务（默认关闭）：设置页与 `--dart-define` 可开启。
+  final SpiderDebugService spiderDebug = SpiderDebugService();
 
   /// 第三方播放器的选集列表：桌面端在 main 里注入；Web 版为 null。
   ExternalPlaylistService? externalPlaylist;
@@ -144,6 +217,9 @@ class AppState extends ChangeNotifier {
 
   bool ready = false;
   List<ConfigProfile> profiles = [];
+
+  /// 订阅原文快照（每个档案最多 3 份，总量最多 12 份），回滚用。
+  List<ConfigSnapshot> profileHistory = [];
   String? activeProfileId;
 
   /// 订阅解析出的基础配置（不含本地 Kazumi 规则源）。
@@ -239,6 +315,9 @@ class AppState extends ChangeNotifier {
   bool eulaAccepted = false;
   List<FavoriteItem> favorites = [];
   List<HistoryItem> history = [];
+
+  /// 历史墓碑：删除 / 清空的版本号。合并外部历史时用它挡住「复活」。
+  HistoryTombstones historyTombstones = HistoryTombstones.empty;
   List<String> searchHistory = [];
   PlayerSettings playerSettings = const PlayerSettings();
 
@@ -250,10 +329,16 @@ class AppState extends ChangeNotifier {
   /// 跳过片头片尾记录（键 `资源|集`；本集无记录时沿用资源最近一次设置）。
   Map<String, SkipRecord> skipSegments = {};
 
+  /// 源健康度落盘防抖：一轮搜索会连续触发几十次成功/失败回调。
+  Timer? _sourceHealthSaveTimer;
+
   /// 本地导入的直播线路：独立于订阅，切档案 / 刷新订阅都不会丢。
   List<LiveBean> localLives = [];
   String assrtToken = '';
   String customSubtitleApis = '';
+
+  /// 自定义直播 UA 设置（默认 UA + 按接口的例外规则）；空 = 沿用自动探测。
+  LiveUaPolicy liveUaPolicy = LiveUaPolicy.none;
   DanmakuSettings danmakuSettings = DanmakuSettings.defaults();
   ContentFilterSettings contentFilter = ContentFilterSettings.defaults();
 
@@ -408,6 +493,13 @@ class AppState extends ChangeNotifier {
       } else {
         entry['timeZone'] = bean.timeZone.trim();
       }
+      // 自定义 UA：留空就删掉该字段，让加载时回落到自动探测
+      // （已知服务用其指定 UA，其余用 okhttp/3.12.0）。
+      if (bean.ua.trim().isEmpty) {
+        entry.remove('ua');
+      } else {
+        entry['ua'] = bean.ua.trim();
+      }
       rawLives[index] = entry;
     });
     if (ok && wasActive) {
@@ -535,15 +627,126 @@ class AppState extends ChangeNotifier {
       );
     }
     try {
+      final stopwatch = Stopwatch()..start();
       final result = await sourceService
           .home(site)
           .timeout(Duration(seconds: site.timeout + 25));
-      return SourceHealth.fromHome(site, result);
+      stopwatch.stop();
+      // 体检成功即自愈：清掉该源的连续失败与冷却，下一次聚合搜索会重新纳入。
+      searchService.markSiteHealthy(site);
+      return SourceHealth.fromHome(
+        site,
+        result,
+      ).withElapsed(stopwatch.elapsedMilliseconds);
     } on TimeoutException {
+      searchService.markSiteFailed(site, '主页请求超时');
       return SourceHealth.failure(site, '主页请求超时（${site.timeout + 25} 秒）');
     } catch (e) {
-      return SourceHealth.failure(site, e);
+      searchService.markSiteFailed(site, e);
+      // 体验话术：告诉用户「为什么失败 + 下一步做什么」，原文仍在日志里。
+      final failure = classifySpiderFailure(
+        e,
+        runtimeInstalled: await runtimeStatusFor(site),
+      );
+      return SourceHealth.failure(site, failure.message);
     }
+  }
+
+  /// 该源依赖的运行时是否已安装；与源无关时返回 null。
+  ///
+  /// 用于区分「真的没装」与「装了但损坏」：两者都报“缺少运行时”，
+  /// 但提示语应该不同（去安装 vs 去重装）。
+  Future<bool?> runtimeStatusFor(SourceBean site) async {
+    if (site.isPySpider) return PyRuntime.instance.installed();
+    if (site.isJarSpider) return JvmRuntime.instance.installed();
+    return null;
+  }
+
+  void _scheduleSourceHealthSave() {
+    _sourceHealthSaveTimer?.cancel();
+    _sourceHealthSaveTimer = Timer(const Duration(milliseconds: 800), () {
+      unawaited(
+        store.setSourceHealthJson(searchService.breaker.exportJsonString()),
+      );
+    });
+  }
+
+  /// 仍在冷却中的源（设置页「源健康」展示）。
+  List<({SourceBean site, SourceCircuitRecord record})> get coolingSources {
+    final out = <({SourceBean site, SourceCircuitRecord record})>[];
+    final now = DateTime.now();
+    for (final site in config?.sites ?? const <SourceBean>[]) {
+      final key = SearchService.healthKeyOf(site);
+      final record = searchService.breaker.recordOf(key);
+      if (record == null || !now.isBefore(record.cooldownUntil)) continue;
+      out.add((site: site, record: record));
+    }
+    out.sort(
+      (a, b) => a.record.cooldownUntil.compareTo(b.record.cooldownUntil),
+    );
+    return out;
+  }
+
+  /// 手动重置某个源（不传 key 时清空全部）的健康度。
+  Future<void> resetSourceHealth([String? healthKey]) async {
+    searchService.breaker.reset(healthKey);
+    await store.setSourceHealthJson(searchService.breaker.exportJsonString());
+    notifyListeners();
+  }
+
+  Future<void> resetSourceHealthOf(SourceBean site) =>
+      resetSourceHealth(SearchService.healthKeyOf(site));
+
+  /// 批量源审计：并发 4 个 `probeSite`，结果按站点顺序流式回填。
+  ///
+  /// 与单源「体检」共用同一条调用链，所以成功 / 失败也会同步到健康度。
+  bool auditingSources = false;
+  int auditDone = 0;
+  int auditTotal = 0;
+  List<SourceHealth> auditResults = const [];
+
+  Future<void> auditSources() async {
+    if (auditingSources) return;
+    final sites = usableSites;
+    if (sites.isEmpty) return;
+    auditingSources = true;
+    auditDone = 0;
+    auditTotal = sites.length;
+    auditResults = const [];
+    notifyListeners();
+    final results = List<SourceHealth?>.filled(sites.length, null);
+    var next = 0;
+    Future<void> worker() async {
+      while (true) {
+        final index = next++;
+        if (index >= sites.length) return;
+        results[index] = await probeSite(sites[index]);
+        auditDone++;
+        auditResults = [for (final item in results) ?item];
+        notifyListeners();
+      }
+    }
+
+    await Future.wait([
+      for (var i = 0; i < 4 && i < sites.length; i++) worker(),
+    ]);
+    auditResults = [for (final item in results) ?item];
+    auditingSources = false;
+    notifyListeners();
+  }
+
+  String auditReportText() {
+    final buffer = StringBuffer()
+      ..writeln('MisaTV 源审计')
+      ..writeln(DateTime.now().toIso8601String())
+      ..writeln('共 ${auditResults.length} 个源');
+    for (final health in auditResults) {
+      buffer.writeln(
+        '${health.ok ? 'OK' : 'FAIL'}\t${health.name}\t${health.statusLabel}\t'
+        '${health.elapsedMs}ms\t${health.message}',
+      );
+    }
+    return buffer.toString();
   }
 
   /// JVM 安装状态变化后重算各配置的导入诊断（JAR 源不再固定降级）。
@@ -605,6 +808,10 @@ class AppState extends ChangeNotifier {
   /// 不探测网盘登录态、不改档案、不清理 JAR 缓存，避免和主窗口互相干扰。
   Future<void> init({bool playerWindow = false}) async {
     profiles = store.loadProfiles();
+    profileHistory = store.loadProfileHistory();
+    // 源健康度跨启动保留：失效源在冷却期内直接跳过，重启后不用再打一遍。
+    searchService.breaker.importJsonString(store.sourceHealthJson);
+    searchService.onHealthChanged = _scheduleSourceHealthSave;
     activeProfileId = store.activeProfileId;
     activeSiteKey = store.activeSiteKey;
     activeLiveProfileId = store.activeLiveProfileId;
@@ -626,23 +833,30 @@ class AppState extends ChangeNotifier {
       ..sort((a, b) => b.createdAt.compareTo(a.createdAt));
     history = store.loadHistory()
       ..sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
+    historyTombstones = store.loadHistoryTombstones();
     searchHistory = store.loadSearchHistory();
     playerSettings = store.loadPlayerSettings();
     sourceService.js.setWorkerCount(playerSettings.jsWorkerPool ? 3 : 1);
     sourceService.jar.setKeepHostsWarm(playerSettings.keepSpiderHosts);
     proxy = ProxyConfig.fromJsonString(store.proxyJson);
-    proxyPoolUnlocked = store.proxyPoolUnlocked;
-    proxyPool.load();
-    // 先按「手动代理 > 代理池节点 > 跟随系统」算出生效代理，再决定要不要后台刷新列表。
     await _applyEffectiveProxy();
-    unawaited(proxyPool.autoRefreshIfDue());
     skipSegments = store.loadSkipSegments();
     driveAccounts = store.loadDriveAccounts();
     if (!playerWindow) xunleiCloudService.load();
     davService.load();
+    syncSettings = store.loadSyncSettings();
+    mediaServers.load();
+    localMedia.load();
+    videoDownloads.loadIfNeeded();
+    if (syncSettings.lanToken.trim().isEmpty) {
+      syncSettings = syncSettings.copyWith(lanToken: newSyncPairingToken());
+      unawaited(store.saveSyncSettings(syncSettings));
+    }
     localLives = store.loadLocalLives();
     assrtToken = store.assrtToken;
     customSubtitleApis = store.customSubtitleApis;
+    liveUaPolicy = LiveUaPolicy.fromJsonString(store.liveUaPolicyJson);
+    LiveUaPolicy.current = liveUaPolicy;
     danmakuSettings = DanmakuSettings.fromJsonString(store.danmakuSettingsJson);
     contentFilter = ContentFilterSettings.fromJsonString(
       store.contentFilterJson,
@@ -652,6 +866,8 @@ class AppState extends ChangeNotifier {
         .map(KazumiRule.fromJson)
         .where((rule) => rule.valid)
         .toList();
+    // 清理旧版本遗留的搜索耗时档案（该功能已移除）。
+    unawaited(store.dropLegacySourceSpeed());
     _syncDriveTokens();
     if (!playerWindow) {
       // 启动时探测已保存的网盘登录态（吸收新 __puus / 识别访客 Cookie），不阻塞首屏。
@@ -717,10 +933,12 @@ class AppState extends ChangeNotifier {
   /// 写 shared_preferences 后主窗口必须 reload 才能看到最新进度。
   Future<void> reloadUserDataFromStore() async {
     await store.reload();
+    videoDownloads.mergeFromStore();
     favorites = store.loadFavorites()
       ..sort((a, b) => b.createdAt.compareTo(a.createdAt));
     history = store.loadHistory()
       ..sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
+    historyTombstones = store.loadHistoryTombstones();
     searchHistory = store.loadSearchHistory();
     playerSettings = store.loadPlayerSettings();
     sourceService.js.setWorkerCount(playerSettings.jsWorkerPool ? 3 : 1);
@@ -730,6 +948,8 @@ class AppState extends ChangeNotifier {
     _syncDriveTokens();
     assrtToken = store.assrtToken;
     customSubtitleApis = store.customSubtitleApis;
+    liveUaPolicy = LiveUaPolicy.fromJsonString(store.liveUaPolicyJson);
+    LiveUaPolicy.current = liveUaPolicy;
     danmakuSettings = DanmakuSettings.fromJsonString(store.danmakuSettingsJson);
     contentFilter = ContentFilterSettings.fromJsonString(
       store.contentFilterJson,
@@ -865,6 +1085,49 @@ class AppState extends ChangeNotifier {
   }
 
   Future<ImportOutcome> importFromUrl(String url, {String? name}) async {
+    final payload = await _loadImportUrl(url, name: name);
+    return _importText(
+      payload.text,
+      url: payload.url,
+      baseUrl: payload.baseUrl,
+      name: payload.name,
+    );
+  }
+
+  /// 导入前预览：拉取 / 解析订阅并与当前点播档案比较，不落盘。
+  Future<ImportPreview> previewImportFromUrl(
+    String url, {
+    String? name,
+  }) async {
+    final payload = await _loadImportUrl(url, name: name);
+    return _buildImportPreview(
+      payload.text,
+      url: payload.url,
+      baseUrl: payload.baseUrl,
+      name: payload.name,
+    );
+  }
+
+  Future<ImportPreview> previewImportText(
+    String text, {
+    String? name,
+  }) async {
+    if (text.trim().isEmpty) throw AppException('请粘贴配置 JSON');
+    return _buildImportPreview(text, url: '', baseUrl: '', name: name);
+  }
+
+  /// 确认预览后真正落盘（沿用预览阶段已经拉到的原文，避免二次请求）。
+  Future<ImportOutcome> commitImportPreview(ImportPreview preview) {
+    return _importText(
+      preview.text,
+      url: preview.url,
+      baseUrl: preview.baseUrl,
+      name: preview.name,
+    );
+  }
+
+  Future<({String text, String url, String baseUrl, String name})>
+  _loadImportUrl(String url, {String? name}) async {
     final trimmed = url.trim();
     if (trimmed.isEmpty) throw AppException('请输入订阅地址');
     // 先只读开头几十 KB：直播单常常有好几 MB 且生成很慢，整份下完再判断
@@ -903,7 +1166,7 @@ class AppState extends ChangeNotifier {
           {'name': label, 'api': trimmed, 'type': 0, 'timeout': 30},
         ],
       });
-      return _importText(liveJson, url: trimmed, name: label);
+      return (text: liveJson, url: trimmed, baseUrl: '', name: label);
     }
     final res = await _fetchSubscription(trimmed);
     final raw = res.body;
@@ -920,13 +1183,90 @@ class AppState extends ChangeNotifier {
           {'name': label, 'api': trimmed, 'type': 0, 'timeout': 30},
         ],
       });
-      return _importText(liveJson, url: trimmed, name: label);
+      return (text: liveJson, url: trimmed, baseUrl: '', name: label);
     }
     if (!body.contains('{')) {
       throw AppException('返回内容不是 TVBox 订阅配置（可能是加密、图片或已失效的接口）');
     }
     // 实际取到配置的地址（可能是 GitHub 镜像）才是相对路径的解析基准。
-    return _importText(body, url: trimmed, baseUrl: res.url, name: name);
+    return (
+      text: body,
+      url: trimmed,
+      baseUrl: res.url,
+      name: (name ?? '').trim(),
+    );
+  }
+
+  ImportPreview _buildImportPreview(
+    String text, {
+    required String url,
+    required String baseUrl,
+    String? name,
+  }) {
+    final body = ConfigParser.decodePayload(text);
+    final parsed = ConfigParser.parse(
+      body,
+      baseUrl: baseUrl.isEmpty ? url : baseUrl,
+      jarReady: jarReady,
+    );
+    if (parsed.multiUrls.isNotEmpty) {
+      throw AppException('多仓订阅暂不支持导入前预览，请直接导入');
+    }
+    final current = activeProfile;
+    final currentConfig = current == null
+        ? const SiteConfig()
+        : ConfigParser.parse(
+            current.rawJson,
+            baseUrl: current.url,
+            jarReady: jarReady,
+          ).config;
+    final newSites = {for (final site in parsed.config.sites) site.key: site};
+    final oldSites = {for (final site in currentConfig.sites) site.key: site};
+    var added = 0;
+    var removed = 0;
+    var changed = 0;
+    for (final entry in newSites.entries) {
+      final old = oldSites[entry.key];
+      if (old == null) {
+        added++;
+        continue;
+      }
+      if (old.api != entry.value.api ||
+          old.type != entry.value.type ||
+          old.name != entry.value.name) {
+        changed++;
+      }
+    }
+    for (final key in oldSites.keys) {
+      if (!newSites.containsKey(key)) removed++;
+    }
+    final newLives = {
+      for (final live in parsed.config.lives) '${live.name}|${live.url}': live,
+    };
+    final oldLives = {
+      for (final live in currentConfig.lives) '${live.name}|${live.url}': live,
+    };
+    for (final key in newLives.keys) {
+      if (!oldLives.containsKey(key)) added++;
+    }
+    for (final key in oldLives.keys) {
+      if (!newLives.containsKey(key)) removed++;
+    }
+    final label = (name ?? '').trim().isNotEmpty
+        ? name!.trim()
+        : (url.isEmpty ? '本地配置' : _nameFromUrl(url, profiles.length + 1));
+    return ImportPreview(
+      text: body,
+      url: url,
+      baseUrl: baseUrl,
+      name: label,
+      siteCount: parsed.config.sites.length,
+      liveCount: parsed.config.lives.length,
+      added: added,
+      removed: removed,
+      changed: changed,
+      warnings: parsed.warnings,
+    );
   }
 
   /// 订阅拉取阶梯（对齐 winbox）：
@@ -1208,6 +1548,36 @@ class AppState extends ChangeNotifier {
   /// 失败时保留本地配置，不打断首屏。
   void startBackgroundTasks() {
     unawaited(_autoRefreshIfDue());
+    unawaited(_warmUpJarSites());
+  }
+
+  /// 启动后台预热 JAR 源：把 JRE 下载 / dex 转换 / JVM 冷启动 / `init()` 解挑战
+  /// 这些几十秒的开销挪到用户点搜索之前。
+  ///
+  /// 刻意做成**串行**：同时拉起多只 JVM 会互相抢 CPU 与磁盘，反而更慢，也会让
+  /// 首屏卡顿。运行时没装时整段跳过（`jarReady == false`），不静默下载运行时。
+  Future<void> _warmUpJarSites() async {
+    if (!jarReady) return;
+    // 先等一会儿：启动瞬间有窗口创建、配置解析、封面加载等更急的事要做。
+    await Future<void>.delayed(const Duration(seconds: 3));
+    final sites = usableSites.where((s) => s.isJarSpider).toList();
+    if (sites.isEmpty) return;
+    // 最多预热 kWarmUpLimit 个：避免订阅里十几个 JAR 源时把启动后的几分钟
+    // 全用来开 JVM。排序用健康度（近期失败的往后）。
+    final plan = buildWarmUpPlan(
+      sites: sites,
+      runtimeReady: jarReady,
+      weightOf: (site) => searchService.breaker.failureCount(
+        SearchService.healthKeyOf(site),
+      ),
+    );
+    for (final item in plan) {
+      final ok = await sourceService.jar.warmUpSite(
+        item.site,
+        runtimeReady: jarReady,
+      );
+      AppLog.i('jar', '启动预热 ${item.site.key} → ${ok ? '完成' : '跳过'}');
+    }
   }
 
   Future<void> _autoRefreshIfDue() async {
@@ -1225,6 +1595,54 @@ class AppState extends ChangeNotifier {
       // 静默失败：继续使用本地已有配置。
       AppLog.w('import', '后台刷新订阅失败（继续使用本地配置）', e);
     }
+  }
+
+  void _rememberProfileSnapshot(ConfigProfile profile) {
+    if (profile.rawJson.trim().isEmpty) return;
+    final snapshot = ConfigSnapshot(
+      profileId: profile.id,
+      name: profile.name,
+      rawJson: profile.rawJson,
+      savedAt: DateTime.now(),
+      siteCount: profile.siteCount,
+      liveCount: profile.liveCount,
+    );
+    final list = [
+      snapshot,
+      ...profileHistory.where(
+        (item) =>
+            item.profileId != profile.id || item.rawJson != profile.rawJson,
+      ),
+    ];
+    final perProfile = <String, int>{};
+    final trimmed = <ConfigSnapshot>[];
+    for (final item in list) {
+      final count = perProfile[item.profileId] ?? 0;
+      if (count >= 3) continue;
+      perProfile[item.profileId] = count + 1;
+      trimmed.add(item);
+      if (trimmed.length >= 12) break;
+    }
+    profileHistory = trimmed;
+    unawaited(store.saveProfileHistory(profileHistory));
+  }
+
+  /// 回滚到某个订阅快照；回滚前会先把当前版本记入历史，可再次撤回。
+  Future<ImportOutcome> restoreProfileSnapshot(ConfigSnapshot snapshot) async {
+    final profile = _profileById(snapshot.profileId);
+    if (profile == null) throw AppException('原订阅已不存在，无法回滚');
+    return _importText(
+      snapshot.rawJson,
+      url: profile.url,
+      name: profile.name,
+      replaceProfileId: profile.id,
+    );
+  }
+
+  Future<void> clearProfileHistory() async {
+    profileHistory = [];
+    await store.saveProfileHistory(profileHistory);
+    notifyListeners();
   }
 
   Future<ImportOutcome> _importText(
@@ -1358,6 +1776,8 @@ class AppState extends ChangeNotifier {
     );
 
     if (existing != null) {
+      // 内容没变的刷新不记快照，避免订阅历史被同一条重复版本占满。
+      if (existing.rawJson != rawJson) _rememberProfileSnapshot(existing);
       profiles = [
         for (final p in profiles)
           if (p.id == existing.id) profile else p,
@@ -1405,7 +1825,9 @@ class AppState extends ChangeNotifier {
       await store.setActiveLiveKey(activeLiveKey);
     }
     await _persistProfiles();
-    if (!liveOnly) searchService.clearCache();
+    if (!liveOnly) {
+      searchService.clearCache();
+    }
     if (activate && !liveOnly && config != null) await _purgeUnusedJars();
     notifyListeners();
     AppLog.i(
@@ -1630,7 +2052,11 @@ class AppState extends ChangeNotifier {
       rawSites[index] = entry;
     }, markAdded: {key});
     // 站点地址被改成本地/远程的新脚本时，下次调用必须重新读取或回源。
-    if (ok) sourceService.py.clearScriptCache();
+    if (ok) {
+      sourceService.py.clearScriptCache();
+      // 接口内容变了：清掉该源的熔断记录，让它重新参与搜索。
+      searchService.breaker.reset(SearchService.healthKeyOf(bean));
+    }
     return ok;
   }
 
@@ -2003,6 +2429,89 @@ class AppState extends ChangeNotifier {
   Future<PlayResult> unwrapPlayPage(PlayResult play) =>
       playPageUnwrap.unwrap(play);
 
+  /// 蜘蛛调试的执行器：按 method 调 SourceService，并把结果序列化成文本。
+  ///
+  /// 只暴露公开入口，不碰内部方法；[onRequest] 交给 AppHttp 的观察者记录，
+  /// 覆盖 Dart 侧的 CMS / JS / PY 请求。jar 蜘蛛走的是 JVM 内的 OkHttp，
+  /// 这里看不到 —— 调试面板会明确标注这一点，不假装能看全。
+  SpiderDebugRunner get spiderDebugRunner =>
+      ({required String method, required Map<String, dynamic> args, required void Function(String) onRequest}) async {
+    final siteKey = (args['site'] ?? '').toString();
+    final site = usableSites.firstWhere(
+      (s) => s.key == siteKey,
+      orElse: () =>
+          throw SpiderDebugException('找不到站点：$siteKey（先检查订阅）'),
+    );
+    final previous = AppHttp.observer;
+    AppHttp.observer = (verb, url) => onRequest('$verb $url');
+    try {
+      switch (method) {
+        case 'home':
+          final result = await sourceService.home(site);
+          return jsonEncode({
+            'items': result.items.map((e) => e.toJson()).toList(),
+            'classes': result.classes
+                .map((c) => {'id': c.id, 'name': c.name})
+                .toList(),
+            'page': result.page,
+            'pagecount': result.pagecount,
+            'total': result.total,
+          });
+        case 'category':
+          final result = await sourceService.category(
+            site,
+            (args['tid'] ?? '').toString(),
+            (args['pg'] ?? '1').toString(),
+            const {},
+          );
+          return jsonEncode({
+            'items': result.items.map((e) => e.toJson()).toList(),
+            'page': result.page,
+            'pagecount': result.pagecount,
+          });
+        case 'detail':
+          final detail = await sourceService.detail(
+            site,
+            (args['id'] ?? '').toString(),
+          );
+          return detail == null ? 'null' : jsonEncode(detail.toJson());
+        case 'search':
+          final items = await sourceService.search(
+            site,
+            (args['wd'] ?? '').toString(),
+          );
+          return jsonEncode({
+            'items': items.map((e) => e.toJson()).toList(),
+          });
+        case 'live':
+          final text = await sourceService.liveContent(
+            site,
+            (args['url'] ?? '').toString(),
+          );
+          return text;
+        case 'play':
+          final config = this.config;
+          if (config == null) {
+            throw const SpiderDebugException('当前没有生效的订阅配置');
+          }
+          final result = await sourceService.resolvePlay(
+            site: site,
+            config: config,
+            flag: (args['flag'] ?? '').toString(),
+            rawUrl: (args['url'] ?? '').toString(),
+            jarReady: jarReady,
+          );
+          return jsonEncode(result.toJson());
+        default:
+          throw SpiderDebugException('不支持的 method：$method');
+      }
+    } on SourceException catch (e) {
+      throw SpiderDebugException(e.message);
+    } finally {
+      AppHttp.observer = previous;
+    }
+  };
+
   /// 播放地址是否需要经本地中继：带 header / HLS / 网盘直链（需要注入 Cookie）
   /// 或开启了 m3u8 去广告时必须走中继。蜘蛛自己的 `127.0.0.1` 取流代理已带
   /// Cookie，不能再套一层中继。
@@ -2017,14 +2526,27 @@ class AppState extends ChangeNotifier {
     final localProxy =
         lower.contains('127.0.0.1') || lower.contains('localhost');
     // 本机取流地址（加固壳 JVM 的 `/chunk`、宿主的 `/proxy`）由壳自己带
-    // Cookie/UA，完全不需要再套中继；而且壳的取流服务会同时发两个
+    // Cookie/UA，通常不需要再套中继；而且壳的取流服务会同时发两个
     // `Content-Length`（Java `HttpExchange` 的常见写法），dart:io 的 HTTP 解析器
     // 会直接抛 `HttpException: The Content-Length header occurred more than once`，
     // 中继这边回 502，播放器只能报 invalid or unsupported media。
-    if (localProxy) return false;
+    //
+    // ★ 唯一例外：壳的 `/proxy?…&type=mpd`（DASH）。它返回的清单里
+    // `<BaseURL>` 指向 bilivideo CDN 且**要求 Referer**；直连时播放器只拿到
+    // MPD 原文，去取分片不带 Referer → 403，用户侧就是「一点开就报错」。
+    // 这类地址必须经中继，由中继改写 BaseURL 并注入 Referer（见 _rewriteMpd）。
+    final shellDash = localProxy &&
+        lower.contains('/proxy') &&
+        lower.contains('type=mpd');
+    if (localProxy && !shellDash) return false;
+    if (shellDash) return true;
+    // DASH 清单（`.mpd`）同样要经中继：它内部的 <BaseURL> 指向 CDN，
+    // 少了中继注入的 Referer/UA 会 403。B 站课堂类源（wex 的 BiliGuard）
+    // 返回的就是 `/proxy?do=bili&...&type=mpd` + `application/dash+xml`。
     return play.headers.isNotEmpty ||
         lower.contains('.m3u8') ||
         lower.contains('m3u8') ||
+        lower.contains('.mpd') ||
         provider.isNotEmpty ||
         purify;
   }
@@ -2067,6 +2589,9 @@ class AppState extends ChangeNotifier {
     );
   }
 
+  /// 播放地址对应的网盘 provider（下载记录持久化后重新包中继用）。
+  String providerForPlay(PlayResult play) => _providerForPlay(play.url, play.flag);
+
   String _providerForPlay(String url, String flag) {
     final host = Uri.tryParse(url)?.host.toLowerCase() ?? '';
     if (host.contains('quark.cn')) return 'quark';
@@ -2108,7 +2633,7 @@ class AppState extends ChangeNotifier {
     return const JsonEncoder.withIndent('  ').convert(merged.toJson());
   }
 
-  /// 导出当前应用的全部设置与本地数据（网盘 Cookie 为明文，界面需提示）。
+  /// 导出当前应用的全部设置与本地数据（备份文件里的网盘 Cookie 为明文，界面需提示）。
   Map<String, dynamic> buildBackupData() => {
     'kind': BackupData.kind,
     'version': BackupData.version,
@@ -2121,6 +2646,9 @@ class AppState extends ChangeNotifier {
     'activeLiveKey': activeLiveKey ?? '',
     'favorites': favorites.map((e) => e.toJson()).toList(),
     'history': history.map((e) => e.toJson()).toList(),
+    // 墓碑要跟历史一起备份：只恢复正文的话，用户在另一台机器上删掉的条目
+    // 会随着旧备份一起回来。
+    'historyTombstones': historyTombstones.toJson(),
     'searchHistory': searchHistory,
     'playerSettings': playerSettings.toJson(),
     'proxy': proxy.toJson(),
@@ -2129,6 +2657,7 @@ class AppState extends ChangeNotifier {
     'kazumiRules': [for (final rule in kazumiRules) rule.raw],
     'assrtToken': assrtToken,
     'customSubtitleApis': customSubtitleApis,
+    'liveUaPolicy': liveUaPolicy.toJson(),
     'danmakuSettings': danmakuSettings.toJson(),
     'contentFilter': contentFilter.toJson(),
     'themeMode': switch (themeMode) {
@@ -2204,6 +2733,31 @@ class AppState extends ChangeNotifier {
               .toList()
             ..sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
     }
+    // 备份里的墓碑与本地墓碑取并集（同一个 key 取更新的一方），
+    // 再据此过滤掉「已删除却还在备份正文里」的条目。
+    var restoredTombstones = historyTombstones;
+    if (data['historyTombstones'] is Map) {
+      final incoming = HistoryTombstones(
+        deletedVersions: HistorySyncSnapshot.stringMapOf(
+          (data['historyTombstones'] as Map)['deleted'],
+        ),
+        clearVersion:
+            ((data['historyTombstones'] as Map)['clear'] ?? '')
+                .toString()
+                .trim()
+                .isEmpty
+            ? null
+            : (data['historyTombstones'] as Map)['clear'].toString(),
+      );
+      restoredTombstones = _mergeTombstones(historyTombstones, incoming);
+    }
+    if (!restoredTombstones.isEmpty) {
+      historyTombstones = restoredTombstones;
+      history = [
+        for (final item in history)
+          if (_survivesTombstones(item, restoredTombstones)) item,
+      ];
+    }
     if (data['searchHistory'] is List) {
       searchHistory = (data['searchHistory'] as List)
           .map((e) => e.toString())
@@ -2241,6 +2795,11 @@ class AppState extends ChangeNotifier {
     }
     if (data.containsKey('customSubtitleApis')) {
       customSubtitleApis = (data['customSubtitleApis'] ?? '').toString();
+    }
+    if (data['liveUaPolicy'] is Map) {
+      liveUaPolicy = LiveUaPolicy.fromJson(
+        Map<String, dynamic>.from(data['liveUaPolicy'] as Map),
+      );
     }
     if (data['danmakuSettings'] is Map) {
       danmakuSettings = DanmakuSettings.fromJson(
@@ -2310,6 +2869,8 @@ class AppState extends ChangeNotifier {
     await store.saveLocalLives(localLives);
     await store.setAssrtToken(assrtToken);
     await store.setCustomSubtitleApis(customSubtitleApis);
+    LiveUaPolicy.current = liveUaPolicy;
+    await store.saveLiveUaPolicyJson(liveUaPolicy.toJsonString());
     await store.saveDanmakuSettingsJson(danmakuSettings.toJsonString());
     await store.saveContentFilterJson(contentFilter.toJsonString());
     await store.saveKazumiRules([for (final rule in kazumiRules) rule.raw]);
@@ -2577,11 +3138,20 @@ class AppState extends ChangeNotifier {
     required int episodeIndex,
     required String url,
     String rawUrl = '',
+    Map<String, String> headers = const {},
     int positionMs = 0,
     int durationMs = 0,
   }) async {
     final key = '${detail.sourceKey}|${detail.id}';
     final now = DateTime.now().millisecondsSinceEpoch;
+    // 历史是明文落盘的，只记防盗链需要的头；Cookie / Authorization 属于
+    // 账号凭据，不能跟着历史一起写出去（网盘线路也不复用历史地址）。
+    const safeHeaderKeys = {'referer', 'user-agent', 'origin'};
+    final savedHeaders = <String, String>{
+      for (final entry in headers.entries)
+        if (safeHeaderKeys.contains(entry.key.toLowerCase()))
+          entry.key: entry.value,
+    };
     history = [
       HistoryItem(
         key: key,
@@ -2597,12 +3167,16 @@ class AppState extends ChangeNotifier {
         episodeIndex: episodeIndex,
         url: url,
         rawUrl: rawUrl,
+        headers: savedHeaders,
         positionMs: positionMs,
         durationMs: durationMs,
       ),
       ...history.where((h) => h.key != key),
     ];
-    if (history.length > 200) history = history.take(200).toList();
+    final limit = playerSettings.historyLimit.clamp(30, 500).toInt();
+    if (history.length > limit) {
+      history = history.take(limit).toList();
+    }
     await store.saveHistory(history);
     notifyListeners();
   }
@@ -2627,16 +3201,111 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// 合并两份墓碑：同一个 key 保留版本更新的一个；清空版本取更新的一方。
+  static HistoryTombstones _mergeTombstones(
+    HistoryTombstones a,
+    HistoryTombstones b,
+  ) {
+    final deleted = Map<String, String>.from(a.deletedVersions);
+    for (final entry in b.deletedVersions.entries) {
+      final existing = deleted[entry.key];
+      if (existing == null ||
+          HistorySyncVersion.compare(entry.value, existing) > 0) {
+        deleted[entry.key] = entry.value;
+      }
+    }
+    final clearA = a.clearVersion;
+    final clearB = b.clearVersion;
+    String? clear;
+    if (clearA == null) {
+      clear = clearB;
+    } else if (clearB == null) {
+      clear = clearA;
+    } else {
+      clear = HistorySyncVersion.compare(clearA, clearB) >= 0 ? clearA : clearB;
+    }
+    return HistoryTombstones(deletedVersions: deleted, clearVersion: clear);
+  }
+
+  /// 一条历史是否不该被墓碑挡住（供备份还原过滤用）。
+  static bool _survivesTombstones(
+    HistoryItem item,
+    HistoryTombstones tombstones,
+  ) {
+    final version = HistorySyncVersion.of(
+      updatedAt: item.updatedAt,
+      eventId: 'local:${item.key}',
+    );
+    final tomb = tombstones.deletedVersions[item.key];
+    if (tomb != null && HistorySyncVersion.compare(version, tomb) <= 0) {
+      return false;
+    }
+    final clear = tombstones.clearVersion;
+    if (clear != null && HistorySyncVersion.compare(version, clear) <= 0) {
+      return false;
+    }
+    return true;
+  }
+
   Future<void> removeHistory(String key) async {
     history = history.where((h) => h.key != key).toList();
+    // 留墓碑：否则独立播放器窗口 / 导入的旧备份会把这条记录带回来。
+    final now = DateTime.now().millisecondsSinceEpoch;
+    historyTombstones = HistoryTombstones(
+      deletedVersions: {
+        ...historyTombstones.deletedVersions,
+        key: HistorySyncVersion.of(
+          updatedAt: now,
+          eventId: 'delete:$key:$now',
+        ),
+      },
+      clearVersion: historyTombstones.clearVersion,
+    );
     await store.saveHistory(history);
+    await store.saveHistoryTombstones(historyTombstones);
     notifyListeners();
   }
 
   Future<void> clearHistory() async {
     history = [];
+    // 清空是全局墓碑：版本早于它的历史一律不再接受。
+    final now = DateTime.now().millisecondsSinceEpoch;
+    historyTombstones = HistoryTombstones(
+      deletedVersions: historyTombstones.deletedVersions,
+      clearVersion: HistorySyncVersion.of(
+        updatedAt: now,
+        eventId: 'clear:$now',
+      ),
+    );
     await store.saveHistory(history);
+    await store.saveHistoryTombstones(historyTombstones);
     notifyListeners();
+  }
+
+  /// 把外部历史（另一台设备 / 独立窗口 / 备份）合并进本地，遵守墓碑规则。
+  ///
+  /// 返回实际被采纳的事件数；0 表示本地已是最新（不会产生多余写盘）。
+  Future<int> mergeExternalHistory(
+    Iterable<HistorySyncEvent> events, {
+    int keepLimit = 200,
+  }) async {
+    final result = mergeHistory(
+      current: history,
+      incoming: events,
+      deletedVersions: historyTombstones.deletedVersions,
+      clearVersion: historyTombstones.clearVersion,
+      keepLimit: keepLimit,
+    );
+    if (result.accepted == 0) return 0;
+    history = result.items;
+    historyTombstones = HistoryTombstones(
+      deletedVersions: result.deletedVersions,
+      clearVersion: result.clearVersion,
+    );
+    await store.saveHistory(history);
+    await store.saveHistoryTombstones(historyTombstones);
+    notifyListeners();
+    return result.accepted;
   }
 
   Future<void> addSearchKeyword(String keyword) async {
@@ -2674,6 +3343,14 @@ class AppState extends ChangeNotifier {
   Future<void> setCustomSubtitleApis(String text) async {
     customSubtitleApis = text.trim();
     await store.setCustomSubtitleApis(customSubtitleApis);
+    notifyListeners();
+  }
+
+  /// 保存自定义直播 UA 设置，并立刻登记到静态策略（LiveService 与中继都读它）。
+  Future<void> setLiveUaPolicy(LiveUaPolicy policy) async {
+    liveUaPolicy = policy;
+    LiveUaPolicy.current = policy;
+    await store.saveLiveUaPolicyJson(policy.toJsonString());
     notifyListeners();
   }
 
@@ -2777,46 +3454,17 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// 决定「到底走哪个代理」，全应用只此一处：
+  /// 决定「到底走哪个代理」：
   ///
-  ///   1. 手动代理（设置里填了地址端口）最优先；
-  ///   2. 其次是代理池里选中的节点，但要先确认它连得上——公共代理大量失效，
-  ///      用它会把所有请求拖成超时；
-  ///   3. 都不是就用用户设置里的「跟随系统代理 / 直连」。
+  ///   1. 手动代理（设置里填了地址端口）优先；
+  ///   2. 否则用「跟随系统代理 / 直连」的开关（默认直连）。
   Future<void> _applyEffectiveProxy() async {
-    final manual = proxy.valid ? proxy : null;
-    final node = proxyPool.selected;
-    ProxyConfig effective = proxy;
-    var source = proxy.followSystem ? '跟随系统代理' : '直连';
-    if (manual != null) {
-      effective = manual;
-      source = '手动代理';
-    } else if (node != null) {
-      if (await _reachable(node.host, node.port)) {
-        effective = ProxyPoolService.configOf(node);
-        source = '代理池 ${node.address}';
-      } else {
-        AppLog.w(
-          'proxy',
-          '代理池节点 ${node.address} 连不上，本次跳过（回落到${proxy.followSystem ? '跟随系统代理' : '直连'}）',
-        );
-      }
-    }
-    await ProxyRuntime.instance.apply(effective);
+    final source = proxy.valid
+        ? '手动代理'
+        : (proxy.followSystem ? '跟随系统代理' : '直连');
+    await ProxyRuntime.instance.apply(proxy);
     await sourceService.jar.resetForNetworkChange();
     AppLog.i('proxy', '生效代理：$source → ${ProxyRuntime.instance.summary}');
-  }
-
-  /// 公共代理是否还活着（TCP 探测在 ProxyRuntime 里做，这里保持平台无关）。
-  Future<bool> _reachable(String host, int port) =>
-      ProxyRuntime.instance.isReachable(host, port);
-
-  /// 解锁代理池入口（设置页连点 5 次），解锁状态持久化。
-  Future<void> unlockProxyPool() async {
-    if (proxyPoolUnlocked) return;
-    proxyPoolUnlocked = true;
-    await store.setProxyPoolUnlocked(true);
-    notifyListeners();
   }
 
   /// 本集应使用的跳过设置（本集记录 → 同资源最近一次设置）。
@@ -2838,6 +3486,34 @@ class AppState extends ChangeNotifier {
       SkipSegment(intro: intro, outro: outro),
       label: label,
     );
+    await store.saveSkipSegments(skipSegments);
+    notifyListeners();
+  }
+
+  /// 导出全部跳过记录（JSON，可跨设备分享）。
+  String skipSegmentsJson() => jsonEncode({
+    for (final entry in skipSegments.entries) entry.key: entry.value.toJson(),
+  });
+
+  /// 导入跳过记录；同键以导入文件为准，其余保留。
+  Future<int> importSkipSegmentsJson(String text) async {
+    final decoded = jsonDecode(text);
+    if (decoded is! Map) throw AppException('片头片尾文件格式不正确');
+    final incoming = <String, SkipRecord>{};
+    for (final entry in decoded.entries) {
+      final record = normalizeSkipRecord(entry.value);
+      if (record == null) continue;
+      incoming[entry.key.toString()] = record;
+    }
+    if (incoming.isEmpty) return 0;
+    skipSegments = {...skipSegments, ...incoming};
+    await store.saveSkipSegments(skipSegments);
+    notifyListeners();
+    return incoming.length;
+  }
+
+  Future<void> clearSkipSegments() async {
+    skipSegments = {};
     await store.saveSkipSegments(skipSegments);
     notifyListeners();
   }
@@ -2944,6 +3620,7 @@ class AppState extends ChangeNotifier {
           );
           driveAccounts = {...driveAccounts, provider: next};
           _syncDriveTokens();
+          LocalRelay.instance.clearPlaySession(provider);
           await store.saveDriveAccounts(driveAccounts);
           notifyListeners();
           unawaited(sourceService.jar.resetDriveState());
@@ -2964,6 +3641,7 @@ class AppState extends ChangeNotifier {
         );
         driveAccounts = {...driveAccounts, provider: next};
         _syncDriveTokens();
+        LocalRelay.instance.clearPlaySession(provider);
         await store.saveDriveAccounts(driveAccounts);
         notifyListeners();
         unawaited(sourceService.jar.resetDriveState());
@@ -2996,6 +3674,7 @@ class AppState extends ChangeNotifier {
     }
     driveAccounts = {...driveAccounts, provider: account};
     _syncDriveTokens();
+    LocalRelay.instance.clearPlaySession(provider);
     await store.saveDriveAccounts(driveAccounts);
     notifyListeners();
     AppLog.i(
@@ -3010,6 +3689,7 @@ class AppState extends ChangeNotifier {
   Future<void> removeDriveAccount(String provider) async {
     driveAccounts = {...driveAccounts}..remove(provider);
     _syncDriveTokens();
+    LocalRelay.instance.clearPlaySession(provider);
     await store.saveDriveAccounts(driveAccounts);
     notifyListeners();
     AppLog.i('drive', '移除网盘账号 provider=$provider');
@@ -3024,6 +3704,176 @@ class AppState extends ChangeNotifier {
 
   Future<void> removeDavServer(String id) async {
     await davService.remove(id);
+    notifyListeners();
+  }
+
+  // ---- 多端同步 ----
+
+  /// 打包当前的历史 / 收藏 / 片头片尾（WebDAV 与局域网共用）。
+  SyncBundle buildSyncBundle() => SyncBundle(
+    exportedAt: DateTime.now().millisecondsSinceEpoch,
+    deviceName: syncDeviceName,
+    history: HistorySyncSnapshot.fromItems(
+      history,
+      deletedVersions: historyTombstones.deletedVersions,
+      clearVersion: historyTombstones.clearVersion,
+    ),
+    favorites: favorites,
+    skips: skipSegments,
+  );
+
+  /// 合并另一台设备的数据包。
+  Future<SyncMergeReport> applySyncBundle(SyncBundle bundle) async {
+    final historyAccepted = await mergeExternalHistory(
+      historyEventsOf(bundle.history),
+    );
+    final mergedFavorites = mergeSyncFavorites(favorites, bundle.favorites);
+    final mergedSkips = mergeSyncSkips(skipSegments, bundle.skips);
+    var wrote = false;
+    if (mergedFavorites.changed > 0) {
+      favorites = mergedFavorites.items;
+      await store.saveFavorites(favorites);
+      wrote = true;
+    }
+    if (mergedSkips.changed > 0) {
+      skipSegments = mergedSkips.items;
+      await store.saveSkipSegments(skipSegments);
+      wrote = true;
+    }
+    if (wrote) notifyListeners();
+    AppLog.i(
+      'sync',
+      '合并同步包「${bundle.deviceName}」：历史 $historyAccepted · '
+          '收藏 ${mergedFavorites.changed} · 片头片尾 ${mergedSkips.changed}',
+    );
+    return SyncMergeReport(
+      historyAccepted: historyAccepted,
+      favoritesChanged: mergedFavorites.changed,
+      skipsChanged: mergedSkips.changed,
+      remoteDevice: bundle.deviceName,
+    );
+  }
+
+  Future<void> saveSyncSettings(SyncSettings next) async {
+    final token = next.lanToken.trim();
+    syncSettings = next.copyWith(
+      remotePath: SyncSettings.normalizeRemotePath(next.remotePath),
+      lanToken: token.isEmpty ? newSyncPairingToken() : token,
+    );
+    await store.saveSyncSettings(syncSettings);
+    notifyListeners();
+  }
+
+  /// WebDAV 双向同步：拉取远端 → 合并到本地 → 把合并结果写回远端。
+  Future<SyncMergeReport> syncViaWebDav({
+    required String serverId,
+    String? remotePath,
+  }) async {
+    if (davService.byId(serverId) == null) {
+      throw AppException('请选择 WebDAV 服务器');
+    }
+    final path = SyncSettings.normalizeRemotePath(
+      remotePath ?? syncSettings.remotePath,
+    );
+    var report = const SyncMergeReport();
+    final remoteText = await davService.getText(serverId, path);
+    if (remoteText != null && remoteText.trim().isNotEmpty) {
+      Map<String, dynamic>? decoded;
+      try {
+        final raw = jsonDecode(remoteText);
+        if (raw is Map) decoded = Map<String, dynamic>.from(raw);
+      } catch (_) {
+        decoded = null;
+      }
+      if (decoded == null) {
+        throw AppException('远端同步文件不是合法 JSON（$path）');
+      }
+      report = await applySyncBundle(SyncBundle.fromJson(decoded));
+    }
+    final merged = buildSyncBundle();
+    await davService.putText(serverId, path, jsonEncode(merged.toJson()));
+    final now = DateTime.now().millisecondsSinceEpoch;
+    syncSettings = syncSettings.copyWith(
+      davServerId: serverId,
+      remotePath: path,
+      lastSyncAt: now,
+    );
+    await store.saveSyncSettings(syncSettings);
+    notifyListeners();
+    AppLog.i('sync', 'WebDAV 同步完成：$path');
+    return report.copyWith(pushed: true);
+  }
+
+  /// 局域网双向同步：拉取对端 → 合并 → 把合并结果推回对端。
+  Future<SyncMergeReport> syncViaLan({
+    required String baseUrl,
+    required String token,
+  }) async {
+    final base = normalizeLanBase(baseUrl);
+    if (base.isEmpty) throw AppException('请填写对方设备地址');
+    final code = token.trim();
+    if (code.isEmpty) throw AppException('请填写配对码');
+    final query = 'token=${Uri.encodeQueryComponent(code)}';
+    final remote = await LanClient.getJson(
+      '$base/sync?$query',
+      timeout: const Duration(seconds: 15),
+    );
+    final bundle = SyncBundle.fromJson(remote);
+    final report = await applySyncBundle(bundle);
+    final merged = buildSyncBundle();
+    final reply = await LanClient.postJson(
+      '$base/sync?$query',
+      merged.toJson(),
+      timeout: const Duration(seconds: 25),
+    );
+    // 对端在收到我们的数据后可能又合并出新结果，再应用一次即可两端一致。
+    final replyBundle = reply['bundle'];
+    if (replyBundle is Map) {
+      await applySyncBundle(SyncBundle.fromJson(Map<String, dynamic>.from(replyBundle)));
+    }
+    syncSettings = syncSettings.copyWith(
+      lastSyncAt: DateTime.now().millisecondsSinceEpoch,
+    );
+    await store.saveSyncSettings(syncSettings);
+    notifyListeners();
+    AppLog.i('sync', '局域网同步完成：$base');
+    return report.copyWith(remoteDevice: bundle.deviceName);
+  }
+
+  Future<int> startLanSyncServer() async {
+    final port = await lanServer.start();
+    notifyListeners();
+    return port;
+  }
+
+  Future<void> stopLanSyncServer() async {
+    if (watchParty.hosting) watchParty.leave();
+    await lanServer.stop();
+    notifyListeners();
+  }
+
+  Future<List<String>> lanSyncAddresses() => lanServer.lanAddresses();
+
+  // ---- 媒体库 ----
+
+  Future<MediaServer> saveMediaServer(MediaServer server) async {
+    final saved = await mediaServers.save(server);
+    notifyListeners();
+    return saved;
+  }
+
+  Future<void> removeMediaServer(String id) async {
+    await mediaServers.remove(id);
+    notifyListeners();
+  }
+
+  Future<void> addLocalMediaDir(String dir) async {
+    await localMedia.addDir(dir);
+    notifyListeners();
+  }
+
+  Future<void> removeLocalMediaDir(String dir) async {
+    await localMedia.removeDir(dir);
     notifyListeners();
   }
 }

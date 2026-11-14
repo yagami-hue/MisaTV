@@ -152,6 +152,9 @@ class TorrentPlay implements BtStreamSource {
   late Aria2Sidecar _sidecar;
   final Map<String, _BtSession> _sessions = {};
 
+  /// 下载管理器复用同一个 aria2 进程（避免两个引擎抢端口/抢任务）。
+  Aria2Sidecar get engine => _sidecar;
+
   /// `/bt` 路由取流入口：命中会话且文件序号一致才给（其余一律 404）。
   @override
   BtStreamInfo? resolveStream(String infoHash, int fileIndex) {

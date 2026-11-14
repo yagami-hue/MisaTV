@@ -7,6 +7,7 @@ import '../../models/live.dart';
 import '../../models/site_config.dart';
 import '../../services/live/epg.dart';
 import '../open_player.dart';
+import '../widgets/live_catchup_sheet.dart';
 import '../widgets/mouse_drag_scroll.dart';
 import 'immersive_widgets.dart';
 
@@ -24,6 +25,7 @@ class _ImmersiveLivePageState extends State<ImmersiveLivePage> {
   String? _error;
   List<LiveGroup> _groups = const [];
   Map<String, EpgEntry> _epg = const {};
+  Map<String, List<EpgProgram>> _programs = const {};
   int _groupIndex = 0;
 
   @override
@@ -55,6 +57,7 @@ class _ImmersiveLivePageState extends State<ImmersiveLivePage> {
       _error = null;
       _groups = const [];
       _epg = const {};
+      _programs = const {};
       _groupIndex = 0;
     });
     try {
@@ -81,12 +84,20 @@ class _ImmersiveLivePageState extends State<ImmersiveLivePage> {
 
   Future<void> _loadEpg(LiveBean bean, List<LiveGroup> groups) async {
     try {
-      final epg = await AppScope.of(context).epgService.loadFor(
+      final programs = await AppScope.of(context).epgService.loadProgramsFor(
         bean: bean,
         channels: groups.expand((g) => g.channels).toList(),
       );
       if (!mounted) return;
-      setState(() => _epg = epg);
+      setState(() {
+        _programs = programs;
+        _epg = programs.isEmpty
+            ? const {}
+            : buildEpgEntries(
+                programs,
+                DateTime.now().millisecondsSinceEpoch,
+              );
+      });
     } catch (_) {
       // EPG 是增强项
     }
@@ -245,6 +256,17 @@ class _ImmersiveLivePageState extends State<ImmersiveLivePage> {
                       _LiveChannelTile(
                         channel: channel,
                         epg: entryOf(_epg, epgRefOf(channel)),
+                        onSchedule: () {
+                          final programs =
+                              lookupEpg(_programs, epgRefOf(channel)) ??
+                              const <EpgProgram>[];
+                          if (programs.isEmpty) return;
+                          showLiveCatchupSheet(
+                            context,
+                            channel: channel,
+                            programs: programs,
+                          );
+                        },
                         onTap: () {
                           final lines = channelLines(channel);
                           if (lines.isEmpty) return;
@@ -267,11 +289,13 @@ class _LiveChannelTile extends StatefulWidget {
     required this.channel,
     required this.epg,
     required this.onTap,
+    this.onSchedule,
   });
 
   final LiveChannel channel;
   final EpgEntry? epg;
   final VoidCallback onTap;
+  final VoidCallback? onSchedule;
 
   @override
   State<_LiveChannelTile> createState() => _LiveChannelTileState();
@@ -290,6 +314,7 @@ class _LiveChannelTileState extends State<_LiveChannelTile> {
       onExit: (_) => setState(() => _hover = false),
       child: GestureDetector(
         onTap: widget.onTap,
+        onLongPress: widget.onSchedule,
         child: AnimatedContainer(
           duration: const Duration(milliseconds: 150),
           width: 232,
@@ -345,6 +370,22 @@ class _LiveChannelTileState extends State<_LiveChannelTile> {
                       color: Colors.white.withValues(alpha: 0.38),
                     ),
                   ),
+                  if (widget.onSchedule != null) ...[
+                    const Spacer(),
+                    Tooltip(
+                      message: '节目单 / 回看',
+                      child: GestureDetector(
+                        onTap: widget.onSchedule,
+                        child: Icon(
+                          Icons.schedule_rounded,
+                          size: 15,
+                          color: theme.colorScheme.primary.withValues(
+                            alpha: 0.75,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
                 ],
               ),
             ],

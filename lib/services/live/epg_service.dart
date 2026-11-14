@@ -25,6 +25,26 @@ class EpgService {
     required List<LiveChannel> channels,
     bool refresh = false,
   }) async {
+    final programs = await loadProgramsFor(
+      bean: bean,
+      channels: channels,
+      refresh: refresh,
+    );
+    if (programs.isEmpty) return const {};
+    return buildEpgEntries(
+      programs,
+      DateTime.now().millisecondsSinceEpoch,
+    );
+  }
+
+  /// 完整节目表（键与 [loadFor] 一致），供节目单与直播回看使用。
+  ///
+  /// 只保留最近 7 天到未来 1 天的节目，避免整份 XMLTV 常驻内存。
+  Future<Map<String, List<EpgProgram>>> loadProgramsFor({
+    required LiveBean bean,
+    required List<LiveChannel> channels,
+    bool refresh = false,
+  }) async {
     final refs = <EpgChannelRef>[];
     for (final channel in channels) {
       final ref = epgRefOf(channel);
@@ -46,8 +66,14 @@ class EpgService {
     }
     if (docs.isEmpty) return const {};
 
-    final programs = buildEpgMap(docs, refs, timeZone: bean.timeZone);
-    return buildEpgEntries(programs, DateTime.now().millisecondsSinceEpoch);
+    final now = DateTime.now().millisecondsSinceEpoch;
+    return buildEpgMap(
+      docs,
+      refs,
+      timeZone: bean.timeZone,
+      fromMs: now - const Duration(days: 7).inMilliseconds,
+      toMs: now + const Duration(days: 1).inMilliseconds,
+    );
   }
 
   Future<String> _loadText(String url, {required bool refresh}) async {

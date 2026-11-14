@@ -61,7 +61,7 @@ class _WindowChromeObserver with WindowListener {
       // 收尾失败也要退出
     }
     try {
-      await windowManager.destroy();
+      await windowManager.destroy().timeout(const Duration(seconds: 2));
     } catch (_) {}
   }
 }

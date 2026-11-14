@@ -354,6 +354,7 @@ class SearchProgress {
     required this.total,
     this.finished = false,
     this.sourceItems = const {},
+    this.filterSummary = '',
   });
   final List<VodItem> items;
   final List<SearchPerSource> perSource;
@@ -363,4 +364,7 @@ class SearchProgress {
 
   /// 每个源自己的原始结果（未做跨源去重），供「只看某个源」切换。
   final Map<String, List<VodItem>> sourceItems;
+
+  /// 结构化搜索语法的生效摘要（如 `2024 · 电影`）；空串表示没有过滤条件。
+  final String filterSummary;
 }

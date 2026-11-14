@@ -14,6 +14,7 @@ class AppRelease {
     this.downloadUrl = '',
     this.assetName = '',
     this.assetSize = 0,
+    this.assetDigest = '',
     this.publishedAt = '',
   });
 
@@ -27,6 +28,9 @@ class AppRelease {
   final String downloadUrl;
   final String assetName;
   final int assetSize;
+
+  /// GitHub 资产摘要（形如 `sha256:...`）；旧 release 可能为空。
+  final String assetDigest;
   final String publishedAt;
 
   /// 实际要打开的下载地址。
@@ -159,12 +163,13 @@ class UpdateService {
       downloadUrl: picked?.url ?? '',
       assetName: picked?.name ?? '',
       assetSize: picked?.size ?? 0,
+      assetDigest: picked?.digest ?? '',
       publishedAt: (json['published_at'] ?? '').toString(),
     );
   }
 
   /// 挑下载资产：优先 Windows 的 zip（本项目就是桌面包），其次任意 zip、exe。
-  static ({String name, String url, int size})? pickAsset(
+  static ({String name, String url, int size, String digest})? pickAsset(
     List<Map<String, Object?>> assets,
   ) {
     final usable = [
@@ -174,6 +179,7 @@ class UpdateService {
             name: (item['name'] ?? '').toString(),
             url: item['browser_download_url'].toString(),
             size: item['size'] is num ? (item['size'] as num).toInt() : 0,
+            digest: (item['digest'] ?? '').toString(),
           ),
     ];
     if (usable.isEmpty) return null;
@@ -210,7 +216,12 @@ class UpdateService {
 
   /// 比较两个版本号：a 比 b 新返回正数，旧返回负数，相等返回 0。
   ///
-  /// 只按点分数字比较（0.10.0 > 0.9.9）；同号时带预发布后缀（`-beta`）的更低。
+  /// 按点分**逐段数值**比较（0.10.0 > 0.9.9）；段数不同时短的一方补 0，
+  /// 所以 `1.2` == `1.2.0`，而 `1.2.3.4` > `1.2.3`。
+  /// 同号时带预发布后缀（`-beta`）的更低。
+  ///
+  /// 不能用「把各段拼成一个数字」的写法（如 `patch + minor*1000 + major*1e6`）：
+  /// 段值超过进制时会直接判错，`1.2.1000` 与 `1.2.3` 就会倒挂。
   static int compareVersions(String a, String b) {
     (List<int>, String) split(String raw) {
       final text = normalizeVersion(raw);
@@ -221,16 +232,18 @@ class UpdateService {
       for (final piece in core.split('.')) {
         parts.add(int.tryParse(piece.replaceAll(RegExp(r'[^0-9]'), '')) ?? 0);
       }
-      while (parts.length < 3) {
-        parts.add(0);
-      }
       return (parts, pre);
     }
 
     final (left, leftPre) = split(a);
     final (right, rightPre) = split(b);
-    for (var i = 0; i < 3; i++) {
-      final diff = left[i] - right[i];
+    // 取两边较长的段数：多出来的段（1.2.3.4 的第四段）必须参与比较，
+    // 否则 `1.2.3.4` 会被静默当成 `1.2.3`。
+    final depth = left.length > right.length ? left.length : right.length;
+    for (var i = 0; i < depth; i++) {
+      final l = i < left.length ? left[i] : 0;
+      final r = i < right.length ? right[i] : 0;
+      final diff = l - r;
       if (diff != 0) return diff;
     }
     if (leftPre == rightPre) return 0;

@@ -18,6 +18,7 @@ Future<void> openRawPlayback(
   int initialIndex = 0,
   String sourceKey = 'local',
   String flag = '本机',
+  Map<String, String> headers = const {},
 }) async {
   if (episodes.isEmpty) return;
   final index = initialIndex.clamp(0, episodes.length - 1);
@@ -39,7 +40,10 @@ Future<void> openRawPlayback(
       flag: flag,
       episodeIndex: index,
       episodes: episodes,
-      initialPlay: PlayResult(url: episodes[index].url),
+      initialPlay: PlayResult(
+        url: episodes[index].url,
+        headers: headers,
+      ),
       ephemeral: true,
     ),
   );

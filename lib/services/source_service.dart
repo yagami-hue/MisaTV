@@ -10,10 +10,22 @@ import 'jar_spider_service.dart';
 import 'js_spider_service.dart';
 import 'kazumi/kazumi_source.dart';
 import 'py_spider_service.dart';
+import 'source/source_adapter.dart';
+import 'source/source_adapters.dart';
 
 class SourceService {
   SourceService(this.cms, this.js, this.py, this.jar)
-    : kazumi = KazumiSource(cms.http);
+    : kazumi = KazumiSource(cms.http) {
+    // 顺序即优先级；CMS 是兜底，必须放最后（它的 supports 恒为 true）。
+    _adapters = [
+      KazumiSourceAdapter(kazumi),
+      JsSourceAdapter(js),
+      PySourceAdapter(py),
+      JarSourceAdapter(jar),
+      CmsSourceAdapter(cms),
+    ];
+  }
+
   final CmsSource cms;
   final JsSpiderService js;
   final PySpiderService py;
@@ -21,6 +33,11 @@ class SourceService {
 
   /// Kazumi 规则源（type=5）：搜索/选集走规则，播放交给网页嗅探。
   final KazumiSource kazumi;
+
+  late final List<SourceAdapter> _adapters;
+
+  SourceAdapter _adapterFor(SourceBean site) =>
+      _adapters.firstWhere((adapter) => adapter.supports(site));
 
   /// 配置级全局 spider jar：JAR 源自身未写 `jar` 时用它。
   void setGlobalJar(String url) => jar.globalJar = url.trim();
@@ -60,13 +77,12 @@ class SourceService {
     }
   }
 
-  Future<CmsResult> home(SourceBean site) => _logged('home', site, () {
-    if (site.isKazumi) return kazumi.home(site);
-    if (site.isJsSpider) return js.home(site);
-    if (site.isPySpider) return py.home(site);
-    if (site.isJarSpider) return jar.home(site);
-    return cms.home(site);
-  }, summarize: (r) => 'items=${r.items.length} classes=${r.classes.length}');
+  Future<CmsResult> home(SourceBean site) => _logged(
+    'home',
+    site,
+    () => _adapterFor(site).home(site),
+    summarize: (r) => 'items=${r.items.length} classes=${r.classes.length}',
+  );
 
   Future<CmsResult> category(
     SourceBean site,
@@ -76,16 +92,7 @@ class SourceService {
   ) => _logged(
     'category',
     site,
-    () {
-      // Kazumi 规则没有分类接口；首页的新番日历按星期几分栏。
-      if (site.isKazumi) {
-        return kazumi.category(site, tid, pg);
-      }
-      if (site.isJsSpider) return js.category(site, tid, pg, filters);
-      if (site.isPySpider) return py.category(site, tid, pg, filters);
-      if (site.isJarSpider) return jar.category(site, tid, pg, filters);
-      return cms.category(site, tid, pg, filters);
-    },
+    () => _adapterFor(site).category(site, tid, pg, filters),
     note: 'tid=$tid pg=$pg filters=${filters.length}',
     summarize: (r) => 'items=${r.items.length} page=${r.page}/${r.pagecount}',
   );
@@ -97,13 +104,7 @@ class SourceService {
   }) => _logged(
     'detail',
     site,
-    () {
-      if (site.isKazumi) return kazumi.detail(site, id, name: name);
-      if (site.isJsSpider) return js.detail(site, id);
-      if (site.isPySpider) return py.detail(site, id);
-      if (site.isJarSpider) return jar.detail(site, id);
-      return cms.detail(site, id);
-    },
+    () => _adapterFor(site).detail(site, id, name: name),
     note: 'id=${shorten(id, 80)}',
     summarize: (d) => d == null
         ? 'null'
@@ -113,13 +114,7 @@ class SourceService {
   Future<List<VodItem>> search(SourceBean site, String keyword) => _logged(
     'search',
     site,
-    () {
-      if (site.isKazumi) return kazumi.search(site, keyword);
-      if (site.isJsSpider) return js.search(site, keyword);
-      if (site.isPySpider) return py.search(site, keyword);
-      if (site.isJarSpider) return jar.search(site, keyword);
-      return cms.search(site, keyword);
-    },
+    () => _adapterFor(site).search(site, keyword),
     note: 'wd=${shorten(keyword, 40)}',
     summarize: (items) => 'items=${items.length}',
   );
@@ -128,12 +123,7 @@ class SourceService {
   Future<String> liveContent(SourceBean site, String url) => _logged(
     'live',
     site,
-    () {
-      if (site.isJsSpider) return js.live(site, url);
-      if (site.isPySpider) return py.live(site, url);
-      if (site.isJarSpider) return jar.live(site, url);
-      throw SourceException('${site.displayName} 不是蜘蛛源，无法加载直播');
-    },
+    () => _adapterFor(site).live(site, url),
     note: 'url=${redactUrl(url)}',
     summarize: (text) => 'chars=${text.length}',
   );
@@ -187,38 +177,24 @@ class SourceService {
     final raw = rawUrl.trim();
     if (raw.isEmpty) return const PlayResult(url: '', message: '播放地址为空');
 
+    final adapter = _adapterFor(site);
+
     // Kazumi 规则：剧集地址是播放页 → parse=1，由上游网页嗅探出媒体直链；
     // 选集接口直接给 m3u8/mp4 时按直链播放。
-    if (site.isKazumi) return kazumi.play(site, raw);
+    if (adapter.family == SourceFamily.kazumi) {
+      return await adapter.play(
+            site,
+            flag,
+            raw,
+            vipFlags: config.flags,
+          ) ??
+          const PlayResult(url: '', message: 'Kazumi 规则未返回播放地址');
+    }
 
     String? spiderError;
-    if (site.isJsSpider) {
+    if (adapter.family != SourceFamily.cms) {
       try {
-        final spiderPlay = await js.play(
-          site,
-          flag,
-          raw,
-          vipFlags: config.flags,
-        );
-        if (spiderPlay != null) return spiderPlay;
-      } on SourceException catch (e) {
-        spiderError = e.message;
-      }
-    } else if (site.isPySpider) {
-      try {
-        final spiderPlay = await py.play(
-          site,
-          flag,
-          raw,
-          vipFlags: config.flags,
-        );
-        if (spiderPlay != null) return spiderPlay;
-      } on SourceException catch (e) {
-        spiderError = e.message;
-      }
-    } else if (site.isJarSpider) {
-      try {
-        final spiderPlay = await jar.play(
+        final spiderPlay = await adapter.play(
           site,
           flag,
           raw,

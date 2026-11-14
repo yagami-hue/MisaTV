@@ -246,6 +246,8 @@ Map<String, List<EpgProgram>> buildEpgMap(
   List<ParsedXmltv> docs,
   List<EpgChannelRef> refs, {
   String timeZone = '',
+  int? fromMs,
+  int? toMs,
 }) {
   final out = <String, List<EpgProgram>>{};
   if (docs.isEmpty || refs.isEmpty) return out;
@@ -288,6 +290,8 @@ Map<String, List<EpgProgram>> buildEpgMap(
       final start = parseXmltvEpoch(programme.start, timeZone: timeZone);
       final stop = parseXmltvEpoch(programme.stop, timeZone: timeZone);
       if (start == null || stop == null || stop <= start) continue;
+      if (fromMs != null && stop < fromMs) continue;
+      if (toMs != null && start > toMs) continue;
       final dedupe = '$start|$stop|${programme.title}';
       if (!seen[idx].add(dedupe)) continue;
       lists[idx].add(EpgProgram(

@@ -79,15 +79,15 @@ void main() {
   });
 
   group('ProxyConfig.followSystem', () {
-    test('默认跟随系统代理，老配置缺键也按跟随', () {
-      expect(const ProxyConfig().followSystem, isTrue);
+    test('默认直连，老配置缺键也按直连', () {
+      expect(const ProxyConfig().followSystem, isFalse);
       expect(
         ProxyConfig.fromJsonString('{"enabled":true}').followSystem,
-        isTrue,
+        isFalse,
       );
       expect(
-        ProxyConfig.fromJsonString('{"followSystem":false}').followSystem,
-        isFalse,
+        ProxyConfig.fromJsonString('{"followSystem":true}').followSystem,
+        isTrue,
       );
     });
 

@@ -47,10 +47,6 @@ class _AppShellState extends State<AppShell> with TickerProviderStateMixin {
   /// 上一次的自动隐藏设置；null 表示还没同步过（首次构建）。
   bool? _lastNavAutoHide;
 
-  /// 「设置」tab 连点计数：5 次解锁代理池入口，2 秒内不点就清零。
-  int _settingsTapCount = 0;
-  DateTime? _lastSettingsTap;
-
   static const _items = [
     _NavItem(
       icon: Icons.home_rounded,
@@ -167,38 +163,6 @@ class _AppShellState extends State<AppShell> with TickerProviderStateMixin {
     await WidgetsBinding.instance.endOfFrame;
     if (!mounted) return;
     await _settingsKey.currentState?.revealRuntime(kind);
-  }
-
-  /// 底部导航点击：顺带统计「设置」连点，5 次解锁代理池。
-  void _onNavTap(int index) {
-    final settingsIndex = _items.length - 1;
-    if (index == settingsIndex) {
-      final now = DateTime.now();
-      final last = _lastSettingsTap;
-      if (last == null || now.difference(last) > const Duration(seconds: 2)) {
-        _settingsTapCount = 0;
-      }
-      _lastSettingsTap = now;
-      _settingsTapCount++;
-      if (_settingsTapCount >= 5) {
-        _settingsTapCount = 0;
-        _lastSettingsTap = null;
-        unawaited(_unlockProxyPool());
-      }
-    } else {
-      _settingsTapCount = 0;
-      _lastSettingsTap = null;
-    }
-    _select(index);
-  }
-
-  Future<void> _unlockProxyPool() async {
-    final app = AppScope.of(context);
-    if (app.proxyPoolUnlocked) return;
-    await app.unlockProxyPool();
-    if (!mounted) return;
-    ScaffoldMessenger.of(context)
-        .showSnackBar(const SnackBar(content: Text('代理池已解锁：设置 → 播放 → 代理池')));
   }
 
   void _select(int index) {
@@ -336,7 +300,7 @@ class _AppShellState extends State<AppShell> with TickerProviderStateMixin {
                                 iconSize: iconSize,
                                 labelSize: labelSize,
                                 borderRadius: itemRadius,
-                                onTap: () => _onNavTap(i),
+                                onTap: () => _select(i),
                               ),
                             ),
                         ],

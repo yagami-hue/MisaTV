@@ -614,7 +614,10 @@ class _DetailPageState extends State<DetailPage> {
     final resource = '${detail.sourceKey}|${detail.id}';
     final rawName = episodes[index].name.trim();
     final episodeKey = rawName.isEmpty ? '第${index + 1}集' : rawName;
-    final skip = app.skipFor(resource, episodeKey);
+    // 全局无痕模式与内置播放器的临时会话一致：不套用跳过片头片尾。
+    final skip = app.playerSettings.incognito
+        ? null
+        : app.skipFor(resource, episodeKey);
     final effectiveStart = startMs > 0 ? startMs : (skip?.intro ?? 0) * 1000;
     final seconds = effectiveStart ~/ 1000;
     final source = app.preparePlay(play, forceRelay: true);
@@ -689,6 +692,11 @@ class _DetailPageState extends State<DetailPage> {
 
     // 播放器已经拉起，历史记录失败不能再回退内置（否则会同时出现两个播放器）。
     app.sourceService.jar.holdPlaybackForExternal();
+    if (app.playerSettings.incognito) {
+      // 全局无痕模式：外部播放器同样不写观看历史。
+      if (mounted) _toast('已在 $playerName 中打开（无痕模式，未记录历史）');
+      return true;
+    }
     try {
       await app.recordHistory(
         detail: detail,
@@ -698,6 +706,7 @@ class _DetailPageState extends State<DetailPage> {
         episodeIndex: index,
         url: play.url,
         rawUrl: episodes[index].url,
+        headers: play.headers,
         positionMs: effectiveStart,
       );
     } catch (_) {

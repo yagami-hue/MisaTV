@@ -157,6 +157,18 @@ class ParseBean {
   );
 }
 
+/// 直播 UA 输入框的说明文案（设置页与文档共用同一措辞）。
+///
+/// 有些直播服务按 UA 下发**不同内容**：不带指定 UA 时列表会指向广告流，
+/// 表现为「能打开但播的是广告」。留空时程序按 host 自动选择已知 UA，
+/// 其余回落 `okhttp/3.12.0`；填了则只对这一个直播源生效。
+///
+/// 「设置 → 直播源 → 自定义直播 UA」里针对具体接口的例外规则会覆盖这里的值；
+/// 那里的全局默认 UA 不会（订阅自带的 ua 优先级更高）。
+const String kLiveUaHelper =
+    '只作用于当前这一条直播源。留空 = 自动：已知服务（如 live.ottiptv.cc）用其指定 UA，'
+    '其余用 okhttp/3.12.0。列表与频道流都会带上它。';
+
 class LiveBean {
   const LiveBean({
     required this.name,
@@ -396,6 +408,45 @@ class ImportReport {
           ),
         )
         .toList(),
+  );
+}
+
+/// 订阅原文的一次快照，用于刷新 / 重新导入后的回滚。
+class ConfigSnapshot {
+  const ConfigSnapshot({
+    required this.profileId,
+    required this.name,
+    required this.rawJson,
+    required this.savedAt,
+    this.siteCount = 0,
+    this.liveCount = 0,
+  });
+
+  final String profileId;
+  final String name;
+  final String rawJson;
+  final DateTime savedAt;
+  final int siteCount;
+  final int liveCount;
+
+  Map<String, dynamic> toJson() => {
+    'profileId': profileId,
+    'name': name,
+    'rawJson': rawJson,
+    'savedAt': savedAt.toIso8601String(),
+    'siteCount': siteCount,
+    'liveCount': liveCount,
+  };
+
+  factory ConfigSnapshot.fromJson(Map<String, dynamic> json) => ConfigSnapshot(
+    profileId: (json['profileId'] ?? '').toString(),
+    name: (json['name'] ?? '').toString(),
+    rawJson: (json['rawJson'] ?? '').toString(),
+    savedAt:
+        DateTime.tryParse((json['savedAt'] ?? '').toString()) ??
+        DateTime.fromMillisecondsSinceEpoch(0),
+    siteCount: (json['siteCount'] as num?)?.toInt() ?? 0,
+    liveCount: (json['liveCount'] as num?)?.toInt() ?? 0,
   );
 }
 

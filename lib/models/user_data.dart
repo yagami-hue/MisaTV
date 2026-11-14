@@ -143,6 +143,7 @@ class HistoryItem {
     this.episodeIndex = 0,
     this.url = '',
     this.rawUrl = '',
+    this.headers = const {},
     this.positionMs = 0,
     this.durationMs = 0,
   });
@@ -166,6 +167,14 @@ class HistoryItem {
   /// `127.0.0.1/chunk` 临时地址在 JVM 退出后就失效了。
   final String rawUrl;
 
+  /// 解析 [url] 时使用的防盗链请求头（Referer / UA / Origin）。
+  ///
+  /// 很多源站的直链不带请求头会回 403，播放器只报
+  /// `invalid or unsupported media`。续播直接复用已解析地址时必须把这份头
+  /// 一起带上；旧记录没有这个字段，读出来是空表。账号凭据类头
+  /// （Cookie / Authorization）不会写进明文历史，见 `AppState.recordHistory`。
+  final Map<String, String> headers;
+
   final int positionMs;
   final int durationMs;
 
@@ -186,6 +195,7 @@ class HistoryItem {
     'episodeIndex': episodeIndex,
     'url': url,
     'rawUrl': rawUrl,
+    'headers': headers,
     'positionMs': positionMs,
     'durationMs': durationMs,
   };
@@ -204,6 +214,11 @@ class HistoryItem {
     episodeIndex: (j['episodeIndex'] as num?)?.toInt() ?? 0,
     url: (j['url'] ?? '').toString(),
     rawUrl: (j['rawUrl'] ?? '').toString(),
+    headers: {
+      for (final entry
+          in (j['headers'] is Map ? j['headers'] as Map : const {}).entries)
+        entry.key.toString(): entry.value.toString(),
+    },
     positionMs: (j['positionMs'] as num?)?.toInt() ?? 0,
     durationMs: (j['durationMs'] as num?)?.toInt() ?? 0,
   );
@@ -214,6 +229,7 @@ class HistoryItem {
     int? episodeIndex,
     String? url,
     String? rawUrl,
+    Map<String, String>? headers,
     int? positionMs,
     int? durationMs,
     int? updatedAt,
@@ -231,6 +247,7 @@ class HistoryItem {
     episodeIndex: episodeIndex ?? this.episodeIndex,
     url: url ?? this.url,
     rawUrl: rawUrl ?? this.rawUrl,
+    headers: headers ?? this.headers,
     positionMs: positionMs ?? this.positionMs,
     durationMs: durationMs ?? this.durationMs,
   );
@@ -358,6 +375,8 @@ class PlayerSettings {
     this.autoSwitchLine = false,
     this.magnetDownloadDir = '',
     this.rememberProgress = true,
+    this.incognito = false,
+    this.historyLimit = 200,
     this.overlayMetrics = kDefaultPlayerOverlayMetrics,
     this.liveOverlayMetrics = kDefaultLivePlayerOverlayMetrics,
     this.overlayFontSize = 14,
@@ -365,7 +384,8 @@ class PlayerSettings {
     this.volume = 1.0,
     this.m3u8Purify = false,
     this.bufferMinSec = 1.0,
-    this.bufferMaxSec = 4.0,
+    this.bufferMaxSec = 15.0,
+    this.bufferTuned = false,
     this.streamCache = false,
     this.streamCacheMb = 1024,
     this.fit = 'contain',
@@ -378,7 +398,7 @@ class PlayerSettings {
     this.artworkPriority = 'douban',
     this.tmdbApiKey = '',
     this.tmdbReadToken = '',
-    this.bossKey = kDefaultBossKey,
+    this.bossKey = kUnsetBossKey,
   });
   final double speed;
   final bool autoPlayNext;
@@ -389,6 +409,13 @@ class PlayerSettings {
   /// 磁力下载/缓存目录；空串 = 应用数据目录下的 `bt`。
   final String magnetDownloadDir;
   final bool rememberProgress;
+
+  /// 全局无痕模式：所有播放都不写观看历史、不更新断点进度，也不套用
+  /// 跳过片头片尾。播放器里的「无痕播放」开关仍可对单次播放临时关闭。
+  final bool incognito;
+
+  /// 观看历史保留条数（30–500）；超出后按时间淘汰最旧记录。
+  final int historyLimit;
 
   /// 画面比例（[PlayerFit.name]）。
   final String fit;
@@ -434,6 +461,8 @@ class PlayerSettings {
     bool? autoSwitchLine,
     String? magnetDownloadDir,
     bool? rememberProgress,
+    bool? incognito,
+    int? historyLimit,
     List<String>? overlayMetrics,
     List<String>? liveOverlayMetrics,
     double? overlayFontSize,
@@ -442,6 +471,7 @@ class PlayerSettings {
     bool? m3u8Purify,
     double? bufferMinSec,
     double? bufferMaxSec,
+    bool? bufferTuned,
     bool? streamCache,
     int? streamCacheMb,
     String? fit,
@@ -461,6 +491,8 @@ class PlayerSettings {
     autoSwitchLine: autoSwitchLine ?? this.autoSwitchLine,
     magnetDownloadDir: magnetDownloadDir ?? this.magnetDownloadDir,
     rememberProgress: rememberProgress ?? this.rememberProgress,
+    incognito: incognito ?? this.incognito,
+    historyLimit: historyLimit ?? this.historyLimit,
     overlayMetrics: overlayMetrics ?? this.overlayMetrics,
     liveOverlayMetrics: liveOverlayMetrics ?? this.liveOverlayMetrics,
     overlayFontSize: overlayFontSize ?? this.overlayFontSize,
@@ -469,6 +501,7 @@ class PlayerSettings {
     m3u8Purify: m3u8Purify ?? this.m3u8Purify,
     bufferMinSec: bufferMinSec ?? this.bufferMinSec,
     bufferMaxSec: bufferMaxSec ?? this.bufferMaxSec,
+    bufferTuned: bufferTuned ?? this.bufferTuned,
     streamCache: streamCache ?? this.streamCache,
     streamCacheMb: streamCacheMb ?? this.streamCacheMb,
     fit: fit ?? this.fit,
@@ -493,7 +526,16 @@ class PlayerSettings {
   final double bufferMinSec;
 
   /// 最大缓冲秒数（fvp/libmdk `bufferRange.max`）：超过就停止继续拉流。
+  ///
+  /// mdk 的默认值只有 4 秒，官方文档也建议「尽量给大」：缓冲太小会把
+  /// 每个分片的网络抖动都直接暴露成播放卡顿，所以默认给 15 秒。
   final double bufferMaxSec;
+
+  /// 用户是否手动调过「播放缓冲」。
+  ///
+  /// 旧版本没有这个字段，而默认值当时是 1s / 4s；据此把「没调过」的配置
+  /// 一次性升级到新的默认缓冲，调过的保持原样。
+  final bool bufferTuned;
 
   /// 边播边缓存：把已下行的分片写进本地磁盘，重看 / 拖动直接读盘。
   final bool streamCache;
@@ -528,6 +570,8 @@ class PlayerSettings {
     'autoSwitchLine': autoSwitchLine,
     'magnetDownloadDir': magnetDownloadDir,
     'rememberProgress': rememberProgress,
+    'incognito': incognito,
+    'historyLimit': historyLimit,
     'overlayMetrics': overlayMetrics,
     'liveOverlayMetrics': liveOverlayMetrics,
     'overlayFontSize': overlayFontSize,
@@ -536,6 +580,7 @@ class PlayerSettings {
     'm3u8Purify': m3u8Purify,
     'bufferMinSec': bufferMinSec,
     'bufferMaxSec': bufferMaxSec,
+    'bufferTuned': bufferTuned,
     'streamCache': streamCache,
     'streamCacheMb': streamCacheMb,
     'fit': fit,
@@ -551,12 +596,22 @@ class PlayerSettings {
     'bossKey': bossKey,
   };
 
-  factory PlayerSettings.fromJson(Map<String, dynamic> j) => PlayerSettings(
+  factory PlayerSettings.fromJson(Map<String, dynamic> j) {
+    // 旧配置没有 bufferTuned：说明用户没动过「播放缓冲」，沿用当时的
+    // 默认值 1s / 4s；4 秒最大缓冲偏小，一次性升级到新的默认值。
+    final tuned = j['bufferTuned'] == true;
+    final storedMin = (j['bufferMinSec'] as num?)?.toDouble();
+    final storedMax = (j['bufferMaxSec'] as num?)?.toDouble();
+    return PlayerSettings(
     speed: (j['speed'] as num?)?.toDouble() ?? 1.0,
     autoPlayNext: (j['autoPlayNext'] as bool?) ?? true,
     autoSwitchLine: (j['autoSwitchLine'] as bool?) ?? false,
     magnetDownloadDir: (j['magnetDownloadDir'] ?? '').toString().trim(),
     rememberProgress: (j['rememberProgress'] as bool?) ?? true,
+    incognito: (j['incognito'] as bool?) ?? false,
+    historyLimit: ((j['historyLimit'] as num?)?.toInt() ?? 200)
+        .clamp(30, 500)
+        .toInt(),
     overlayMetrics:
         (j['overlayMetrics'] as List?)
             ?.map((e) => '$e')
@@ -575,12 +630,13 @@ class PlayerSettings {
         .clamp(0.0, 1.0)
         .toDouble(),
     m3u8Purify: (j['m3u8Purify'] as bool?) ?? false,
-    bufferMinSec: ((j['bufferMinSec'] as num?)?.toDouble() ?? 1.0)
+    bufferMinSec: ((tuned ? storedMin : null) ?? 1.0)
         .clamp(0.2, 30.0)
         .toDouble(),
-    bufferMaxSec: ((j['bufferMaxSec'] as num?)?.toDouble() ?? 4.0)
+    bufferMaxSec: ((tuned ? storedMax : null) ?? 15.0)
         .clamp(1.0, 120.0)
         .toDouble(),
+    bufferTuned: tuned,
     streamCache: (j['streamCache'] as bool?) ?? false,
     streamCacheMb: ((j['streamCacheMb'] as num?)?.toInt() ?? 1024)
         .clamp(128, 16384)
@@ -600,38 +656,58 @@ class PlayerSettings {
     tmdbApiKey: (j['tmdbApiKey'] ?? '').toString().trim(),
     tmdbReadToken: (j['tmdbReadToken'] ?? '').toString().trim(),
     bossKey: normalizeBossKey((j['bossKey'] ?? '').toString()),
-  );
+    );
+  }
 }
 
-/// 老板键默认值：Ctrl + Shift + B。
-const String kDefaultBossKey = 'ctrl+shift+b';
+/// 老板键「未设置」：**默认不注册任何全局热键**。
+///
+/// 以前默认绑 Ctrl + Shift + B，而这个组合在 Windows 上冲突率很高（浏览器、
+/// 输入法、各类工具都在抢）。注册失败会让用户在毫无提示的情况下失去老板键，
+/// 更糟的是旧版本在引擎就绪前注册失败还会直接崩进程。现在改成：不主动占用
+/// 任何组合，用户自己选了才生效。
+const String kUnsetBossKey = '';
 
-/// 老板键可选项（值 → 显示名）。`off` 表示不注册全局热键。
+/// 老板键可选项（值 → 显示名）。
+///
+/// [kUnsetBossKey] 表示不注册全局热键；其余组合都**必须由用户显式选择**。
 const List<(String, String)> kBossKeyShortcuts = [
-  (kDefaultBossKey, 'Ctrl + Shift + B'),
+  (kUnsetBossKey, '未设置'),
+  ('ctrl+shift+b', 'Ctrl + Shift + B'),
   ('ctrl+alt+b', 'Ctrl + Alt + B'),
+  ('ctrl+shift+f', 'Ctrl + Shift + F'),
   ('alt+q', 'Alt + Q'),
   ('alt+x', 'Alt + X'),
+  ('alt+z', 'Alt + Z'),
   ('f12', 'F12'),
-  ('off', '关闭'),
 ];
 
-/// 老板键归一：只接受预设组合与 `off`，未知值回落到默认组合。
+/// 旧版本里表示「关闭」的值，统一归一到 [kUnsetBossKey]。
+const String _legacyBossKeyOff = 'off';
+
+/// 老板键归一：只接受预设组合与「未设置」，未知值回落到 [kUnsetBossKey]。
+///
+/// 注意这里**不能**再回落到某个默认组合：那等于替用户占用了一个他从未选择过的
+/// 全局热键（而且很可能已被别的软件占用）。
 String normalizeBossKey(String raw) {
   final value = raw.trim().toLowerCase().replaceAll(' ', '');
+  if (value.isEmpty || value == _legacyBossKeyOff) return kUnsetBossKey;
   for (final item in kBossKeyShortcuts) {
     if (item.$1 == value) return value;
   }
-  return kDefaultBossKey;
+  return kUnsetBossKey;
 }
 
-/// 老板键显示名（如 `Ctrl + Shift + B`）。
+/// 老板键是否已配置（用户显式选过）。
+bool isBossKeySet(String raw) => normalizeBossKey(raw).isNotEmpty;
+
+/// 老板键显示名（如 `Ctrl + Shift + B`）；未设置时返回「未设置」。
 String bossKeyLabel(String raw) {
   final value = normalizeBossKey(raw);
   for (final item in kBossKeyShortcuts) {
     if (item.$1 == value) return item.$2;
   }
-  return 'Ctrl + Shift + B';
+  return '未设置';
 }
 
 /// 横图封面来源归一：只认 douban / tmdb / imdb，未知值回落到豆瓣。

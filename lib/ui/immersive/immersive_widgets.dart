@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../../app.dart';
 import '../../core/theme/app_theme.dart';
@@ -178,6 +179,8 @@ class ImmersiveCard extends StatefulWidget {
     this.showText = true,
     this.progress = 0,
     this.artworkTitle = '',
+    this.focusNode,
+    this.onFocus,
   });
 
   final String title;
@@ -195,24 +198,63 @@ class ImmersiveCard extends StatefulWidget {
   /// 0~1 的观看进度；0 不绘制。
   final double progress;
 
+  /// 遥控器 / 键盘焦点节点：不传时卡片不可键盘聚焦（纯鼠标场景）。
+  final FocusNode? focusNode;
+
+  /// 获得焦点时回调，供外层记录「上次聚焦的是哪个条目」。
+  final VoidCallback? onFocus;
+
   @override
   State<ImmersiveCard> createState() => _ImmersiveCardState();
 }
 
 class _ImmersiveCardState extends State<ImmersiveCard> {
   bool _hover = false;
+  bool _focused = false;
+
+  @override
+  void initState() {
+    super.initState();
+    widget.focusNode?.addListener(_onFocusChange);
+  }
+
+  @override
+  void didUpdateWidget(covariant ImmersiveCard oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.focusNode != widget.focusNode) {
+      oldWidget.focusNode?.removeListener(_onFocusChange);
+      widget.focusNode?.addListener(_onFocusChange);
+    }
+  }
+
+  @override
+  void dispose() {
+    widget.focusNode?.removeListener(_onFocusChange);
+    super.dispose();
+  }
+
+  void _onFocusChange() {
+    final hasFocus = widget.focusNode?.hasFocus ?? false;
+    if (hasFocus) widget.onFocus?.call();
+    if (hasFocus != _focused && mounted) {
+      setState(() => _focused = hasFocus);
+    }
+  }
+
+  /// 鼠标悬停与键盘焦点共用同一套高亮，TV / 桌面手感一致。
+  bool get _active => _hover || _focused;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    return MouseRegion(
+    final card = MouseRegion(
       cursor: SystemMouseCursors.click,
       onEnter: (_) => setState(() => _hover = true),
       onExit: (_) => setState(() => _hover = false),
       child: GestureDetector(
         onTap: widget.onTap,
         child: AnimatedScale(
-          scale: _hover ? 1.035 : 1,
+          scale: _active ? 1.035 : 1,
           duration: const Duration(milliseconds: 160),
           curve: Curves.easeOut,
           child: SizedBox(
@@ -226,11 +268,11 @@ class _ImmersiveCardState extends State<ImmersiveCard> {
                   decoration: BoxDecoration(
                     borderRadius: BorderRadius.circular(14),
                     border: Border.all(
-                      color: _hover
+                      color: _active
                           ? theme.colorScheme.primary.withValues(alpha: 0.75)
                           : Colors.white.withValues(alpha: 0.08),
                     ),
-                    boxShadow: _hover
+                    boxShadow: _active
                         ? [
                             BoxShadow(
                               color: theme.colorScheme.primary.withValues(
@@ -360,6 +402,37 @@ class _ImmersiveCardState extends State<ImmersiveCard> {
                 ],
               ],
             ),
+          ),
+        ),
+      ),
+    );
+    // 没有焦点节点时保持纯鼠标卡片：沉浸模式里的大部分卡片仍由鼠标操作，
+    // 只有需要遥控器导航的列表才传入 focusNode。
+    final node = widget.focusNode;
+    if (node == null) return card;
+    return Focus(
+      focusNode: node,
+      // 键盘焦点不应该画 Flutter 默认的焦点框：我们用 _active 自己画高亮。
+      child: Builder(
+        builder: (context) => Shortcuts(
+          shortcuts: const <ShortcutActivator, Intent>{
+            // 回车与遥控器 OK 键都归到 ActivateIntent。
+            // 注意不要同时写 numpadEnter：它与 enter 是同一个 logical key，
+            // 放进 const map 会被判重复键。
+            SingleActivator(LogicalKeyboardKey.enter): ActivateIntent(),
+            SingleActivator(LogicalKeyboardKey.select): ActivateIntent(),
+            SingleActivator(LogicalKeyboardKey.gameButtonA): ActivateIntent(),
+          },
+          child: Actions(
+            actions: <Type, Action<Intent>>{
+              ActivateIntent: CallbackAction<ActivateIntent>(
+                onInvoke: (_) {
+                  widget.onTap();
+                  return null;
+                },
+              ),
+            },
+            child: card,
           ),
         ),
       ),

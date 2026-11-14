@@ -1,7 +1,7 @@
 /// WebDAV 存储（OpenList / AList / Nextcloud / 群晖 / 坚果云 …）的只读直连契约。
 ///
 /// 与旧版 Win-Box 同口径：只做 **PROPFIND 列目录 + GET 取流**，不做上传/转存。
-/// 服务器凭据与网盘 Cookie 一样明文落在本机偏好里（界面需提示）。
+/// 服务器凭据与网盘 Cookie 一样经本机凭据加密后落盘（Windows DPAPI）。
 class DavServer {
   const DavServer({
     required this.id,

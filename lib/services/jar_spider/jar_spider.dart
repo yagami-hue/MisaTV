@@ -19,6 +19,7 @@ import '../../models/site_config.dart';
 import '../../models/vod.dart';
 import '../drive/baidu_native.dart';
 import '../drive/drive_ext.dart';
+import '../drive/quark_native.dart';
 import '../drive/uc_native.dart';
 import '../runtime_extension.dart';
 import '../jvm/arm_bridge_runtime.dart';
@@ -26,6 +27,7 @@ import '../relay/local_relay.dart';
 import '../jvm/jvm_runtime.dart';
 import '../movie_parser.dart';
 import '../play_result_parser.dart';
+import 'bili_dash_fallback.dart';
 import 'hyms_native.dart';
 import 'spider_env.dart';
 import 'spider_host.dart';
@@ -119,9 +121,12 @@ class JarSpiderService {
     JvmRuntime? runtime,
     this.driveTokens,
     this.driveSeed,
-    AppHttp? http,
+    this.http,
   }) : _runtimeOverride = runtime,
        _hymsNative = http == null ? null : HymsNative(http);
+
+  /// 供壳外回退（如 B 站 DASH → durl）直接发请求用。
+  final AppHttp? http;
 
   final JvmRuntime? _runtimeOverride;
   JvmRuntime get runtime => _runtimeOverride ?? JvmRuntime.instance;
@@ -183,6 +188,49 @@ class JarSpiderService {
   void setKeepHostsWarm(bool value) {
     _serveIdleTimeout = value ? _serveIdleKeepWarm : _serveIdleDefault;
   }
+
+  /// 已经预热过（或正在预热）的源：同一个源只预热一次，避免反复拉起 JVM。
+  final Set<String> _warmed = {};
+
+  /// 后台预热一个 JAR 源的常驻 host。
+  ///
+  /// 为什么需要它：JAR 源的**首次**调用要下载 JRE、做 jar→dex 转换、起 JVM、
+  /// 蜘蛛 `init()` 解挑战，几十秒起步。等用户点搜索才开始，第一批结果注定慢。
+  /// 应用启动后在后台把这件事先做掉，用户真正搜索时只剩一次普通请求。
+  ///
+  /// 约束：
+  ///   · 绝不抛错 —— 预热失败不应影响启动，失败就让真正搜索时重试；
+  ///   · 不写健康度 —— 它不代表用户可见的一次失败；
+  ///   · 由调用方用 [runtimeReady] 把关：JVM 运行时没装时直接跳过，
+  ///     否则预热会静默下载几十 MB 运行时，用户会以为软件卡住了。
+  Future<bool> warmUpSite(
+    SourceBean site, {
+    required bool runtimeReady,
+    Duration? timeout,
+  }) async {
+    if (!site.isJarSpider) return false;
+    if (!runtimeReady) return false;
+    final key = '${site.key}\u0000${site.jar}\u0000${site.api}';
+    if (!_warmed.add(key)) return true; // 已经预热过 / 正在预热
+
+    try {
+      // 用 home 而不是直接起 host：home 走的是和真实搜索完全相同的链路
+      // （加载脚本 → 起 serve host → spider.init → 首次请求），预热才有意义。
+      await home(site).timeout(timeout ?? const Duration(seconds: 90));
+      _touchServe(site.key);
+      AppLog.i('jar', '预热完成 ${site.key}');
+      return true;
+    } catch (e) {
+      // 允许下次重试：预热失败不该被永久记住（可能只是当时网络抖了）。
+      _warmed.remove(key);
+      AppLog.i('jar', '预热跳过 ${site.key}：${redactUrl('$e')}');
+      return false;
+    }
+  }
+
+  /// 该源是否已经预热过（诊断 / 测试用）。
+  bool isWarmed(SourceBean site) =>
+      _warmed.contains('${site.key}\u0000${site.jar}\u0000${site.api}');
 
   /// 配置级的全局 spider jar（`SiteConfig.spider`），站点自带 `jar` 时优先站点。
   String globalJar = '';
@@ -320,7 +368,7 @@ class JarSpiderService {
     return MovieParser.toItems(body.movie, site.key);
   }
 
-  /// 百度 / UC 分享型播放的原生「免转存」解链（只读分享，不写用户网盘）。
+  /// 百度 / UC / 夸克 分享型播放的原生「免转存」解链（只读分享，不写用户网盘）。
   ///
   /// 返回 null 表示：不是网盘分享、未绑定账号或解链失败 —— 交回 jar 兜底。
   Future<PlayResult?> _resolveNativeDrivePlay(String flag, String id) async {
@@ -358,6 +406,27 @@ class JarSpiderService {
           return PlayResult(url: link.url, flag: flag, headers: link.headers);
         }
         AppLog.w('drive', 'UC 免转存解链失败：${link.reason}');
+      }
+    }
+    // 夸克排在自己的分支：fty 系壳会把夸克分享塞进 `{sId,fid,share_fid_token,…}`
+    // 这类集参数里，只有线路名明确是夸克时才解释，避免和 UC 抢同一批 id。
+    final quarkCookie = (tokens['quark'] ?? '').trim();
+    if (looksLikeQuarkShare(id, flag: flag)) {
+      if (quarkCookie.isEmpty) {
+        AppLog.w('drive', '夸克分享播放但未绑定账号，回退 jar：${shorten(id, 80)}');
+      } else {
+        final ref = extractQuarkShare(id, flag: flag);
+        final link = await resolveQuarkDirect(
+          id,
+          cookie: quarkCookie,
+          flag: flag,
+          episodeName: ref?.name ?? '',
+        );
+        if (link.ok) {
+          AppLog.i('drive', '夸克免转存直链 ${shorten(link.url, 120)}');
+          return PlayResult(url: link.url, flag: flag, headers: link.headers);
+        }
+        AppLog.w('drive', '夸克免转存解链失败：${link.reason}');
       }
     }
     return null;
@@ -423,6 +492,34 @@ class JarSpiderService {
         result = normalizeSpiderPlay(text, flag);
       }
     }
+    // ★ 壳只下发 DASH 时的回退（「高中课堂 / 少儿教育」这类 wex 源的常见形态）。
+    // 壳的 playerContent 给的是 127.0.0.1:<jvm>/proxy?do=bili&...&type=mpd +
+    // application/dash+xml，而内置内核（libmdk + 随包 ffmpeg）只有 dash muxer、
+    // 没有 dashdec，MPD 一定播不了。改走官方 playurl?fnval=1 的 durl 单文件 mp4
+    // （音轨已在内），这是内核对 mov/mp4 能解的形态。
+    //
+    // 必须在 _keepPlayHost 之前做：回退成功后壳的常驻进程就没必要再留。
+    if (result.url.isNotEmpty &&
+        BiliDashFallback.looksLikeShellDash(result.url)) {
+      final client = http;
+      final fallback = client == null
+          ? null
+          : await BiliDashFallback.resolve(
+              client,
+              result.url,
+              cookie: (driveTokens?.call()['bili'] ?? '').trim(),
+              flag: result.flag.isEmpty ? flag : result.flag,
+            );
+      if (fallback != null) {
+        await _releasePlayHost();
+        return fallback;
+      }
+      AppLog.w(
+        'jar',
+        'DASH 回退未成功，保留原地址（播放器将报不支持） ${site.key} '
+        'flag=$flag url=${redactUrl(result.url)}',
+      );
+    }
     final host = _playHost;
     if (text.trim().isEmpty) {
       await _releasePlayHost();
@@ -469,8 +566,9 @@ class JarSpiderService {
             message: result.message,
           );
         }
-        // 宿主代理形态（9978 / -1）按本 JVM 的实际端口对齐；壳内端口原样保留
-        final url = rewriteLocalProxy(result.url, host.proxyPort);
+        // 宿主代理形态（9978 / -1）按本 JVM 的实际端口对齐；壳内端口原样保留。
+        // 壳的 thread/chunk 会被服务端夹到 1..10，壳却常发 16/32，白丢并发。
+        final url = tuneChunkUrl(rewriteLocalProxy(result.url, host.proxyPort));
         _keepPlayHost(host);
         return PlayResult(
           url: url,
@@ -601,7 +699,7 @@ class JarSpiderService {
     if (!local) return result;
     // 没有常驻 host 的本机地址（一次性进程返回的 /chunk、/proxy）必然已失效。
     if (host == null || hostKey == null || !host.alive) return null;
-    final url = rewriteLocalProxy(result.url, host.proxyPort);
+    final url = tuneChunkUrl(rewriteLocalProxy(result.url, host.proxyPort));
     _keepPlayServeHost(host, hostKey);
     AppLog.i(
       'jar',
@@ -750,6 +848,58 @@ class JarSpiderService {
     if (host != '127.0.0.1' && host != 'localhost') return false;
     return uri.path == '/chunk';
   }
+
+  /// 把壳给的 `/chunk` 地址按实测最优的 `thread` / `chunk` 重写。
+  ///
+  /// 加固壳自己决定并发与分片大小，写死在 `MyPan$*MineProvider`：
+  /// 会员 `thread=32 / chunk=64(KB)`，非会员 `thread=16 / chunk=512`。
+  /// 而服务端（`merge.j.c`）把 thread 夹到 [1,10]、chunk 当 KB 用 ——
+  /// 壳发 16/32 都被砍成 10，白白浪费并发；chunk=64KB 更是过小。
+  ///
+  /// 实测同一夸克直链（thread 固定 10，chunk 按 KB）：
+  ///   256 -> 6.8 MB/s · 512 -> 13.0 · 1024 -> 19.1 · 2048 -> 25.9 · 4096 -> 17.0
+  ///
+  /// 只改 `thread` / `chunk` 两个参数，其余（id、签名等）**按原始字节保留**。
+  /// 不能用 `Uri.replace(queryParameters:)` 重建：它会重新编码其它参数
+  /// （实测 `sign=a/b+c=` 会变成 `a%2Fb+c%3D`），壳若对原始 query 验签会直接播不了。
+  /// 不是本机 `/chunk` 或缺少 `chunk` 参数时原样返回。
+  static String tuneChunkUrl(String url) {
+    if (!isLocalChunkPlayUrl(url)) return url;
+    final trimmed = url.trim();
+    final qIndex = trimmed.indexOf('?');
+    if (qIndex < 0) return url;
+    final hashIndex = trimmed.indexOf('#', qIndex + 1);
+    final query = hashIndex < 0
+        ? trimmed.substring(qIndex + 1)
+        : trimmed.substring(qIndex + 1, hashIndex);
+    if (query.isEmpty) return url;
+    final parts = query.split('&');
+    var hasChunk = false;
+    var hasThread = false;
+    for (var i = 0; i < parts.length; i++) {
+      final pair = parts[i];
+      final eq = pair.indexOf('=');
+      final key = eq < 0 ? pair : pair.substring(0, eq);
+      if (key == 'chunk') {
+        hasChunk = true;
+        parts[i] = 'chunk=$_chunkKb';
+      } else if (key == 'thread') {
+        hasThread = true;
+        parts[i] = 'thread=$_chunkThreads';
+      }
+    }
+    // 没有 chunk 参数说明不是这套壳的 /chunk 形态，不动。
+    if (!hasChunk) return url;
+    if (!hasThread) parts.add('thread=$_chunkThreads');
+    final suffix = hashIndex < 0 ? '' : trimmed.substring(hashIndex);
+    return '${trimmed.substring(0, qIndex + 1)}${parts.join('&')}$suffix';
+  }
+
+  /// 服务端把 thread 夹到 1..10，直接给上限。
+  static const int _chunkThreads = 10;
+
+  /// 分片大小（KB）：实测 2MB 最快（见 tuneChunkUrl 注释里的对照表）。
+  static const int _chunkKb = 2048;
 
   /// 把 `/chunk` 地址先打一次 Range 探针再交给外部播放器。
   ///
@@ -2119,13 +2269,28 @@ class JarSpiderService {
         );
       }
     }
+    // `*` 只是「历史上某个壳用过的包」，**不是**本类的记录。
+    //
+    // 踩坑记录：一个 jar key 下常有多只壳共享同一批聚合包（c3bb107b 就是 30 个
+    // Wex 壳），`*` 往往指向另一个聚合包（b66f…，里面一个 Wex 类都没有）。
+    // 若把 `*` 无条件塞进候选，它会占掉一个候选位，还可能被优先试跑 —— 表现为
+    // 「以前能用的壳突然 ClassNotFound / 原生解密失败」。
+    //
+    // 因此这里要求：`*` 必须真的含目标类才收；不含就直接跳过，让后面的全量扫描
+    // 去找正确的包。
     if (index['*'] != null) {
       final path = p.join(dir.path, index['*']!);
       if (File(path).existsSync()) {
-        add(
-          index['*'],
-          wanted.isEmpty ? null : await _zipNames(File(path)),
-        );
+        final starNames = wanted.isEmpty ? null : await _zipNames(File(path));
+        final hit = wanted.isEmpty || (starNames != null && containsWanted(starNames));
+        if (hit) {
+          add(index['*'], starNames);
+        } else {
+          AppLog.i(
+            'jar',
+            '跳过默认载荷 ${index['*']}：不含 ${className ?? '目标类'}',
+          );
+        }
       }
     }
     final seenSignatures = <String>{
@@ -2601,8 +2766,53 @@ class JarSpiderService {
     } catch (_) {
       // 索引损坏时当作没有：下一次成功会重写
     }
+    // 清掉「让某只壳加载失败」的脏记录。
+    //
+    // 老版本曾把 `*` 无条件当候选，导致某些壳被记到不含它的包上；这些记录会
+    // 一直留着，表现为「以前能用、现在一直失败」。精确记录若不含目标类，
+    // 说明它是在错误候选上写下的，删除后由本次调用重新扫描出正确包。
+    await _dropStaleIndexEntries(key, dir, index);
     _payloadIndexCache[key] = index;
     return index;
+  }
+
+  /// 校验并删除 index 里「包中不含目标类」的精确记录。
+  Future<void> _dropStaleIndexEntries(
+    String key,
+    Directory dir,
+    Map<String, String> index,
+  ) async {
+    final stale = <String>[];
+    for (final entry in index.entries) {
+      if (entry.key == '*') continue; // `*` 在选择时另行校验，见 _payloadCandidates
+      final cls = entry.key;
+      final wanted = _payloadClassEntries(cls);
+      if (wanted.isEmpty) continue;
+      final file = File(p.join(dir.path, entry.value));
+      if (!file.existsSync()) continue;
+      try {
+        final names = await _zipNames(file);
+        if (!names.any(wanted.contains)) {
+          stale.add(cls);
+          AppLog.i(
+            'jar',
+            '清理过期载荷索引 key=$key class=$cls pkg=${entry.value}（包内无该类）',
+          );
+        }
+      } catch (_) {
+        // 读不了包就保持原样，交给运行时判定
+      }
+    }
+    if (stale.isEmpty) return;
+    for (final cls in stale) {
+      index.remove(cls);
+    }
+    try {
+      final file = File(p.join(dir.path, 'index.json'));
+      await file.writeAsString(jsonEncode(index), flush: true);
+    } catch (_) {
+      // 写失败时至少内存里已清掉
+    }
   }
 
   Future<void> _rememberPayload(
@@ -3489,8 +3699,16 @@ class JarSpiderService {
       );
       // JVM 会先在 stderr 报实际绑定端口（[host-proxy] listening port=）；
       // 还没报到时用确定性端口兜底，报到了就不覆盖（端口冲突会退化到临时端口）。
+      //
+      // ★ 兜底必须用**与 `_proxyProps` 完全相同的 key**（jar 的完整路径）。
+      // `-Dtvbox.proxy.port` 是按 `_proxyPort(jarPath)` 算的；这里若拿
+      // `basenameWithoutExtension` 再算一次，两者是不同的端口（实测同一份 jar：
+      // 完整路径 → 19980，basename → 19976）。当 stubs 的 `com.github.catvod.Proxy`
+      // 没能起监听、stderr 没有 `[host-proxy]` 那行时，`rewriteLocalProxy` 会把壳吐出的
+      // `127.0.0.1:<壳端口>/proxy?do=bili…` 改写到这个**没人监听**的兜底端口，
+      // 播放器拿到连接被拒 → 「invalid or unsupported media」（高中课堂 / B站线路实测）。
       if (host.proxyPort <= 0) {
-        host.proxyPort = _proxyPort(p.basenameWithoutExtension(jar));
+        host.proxyPort = _proxyPort(jar);
       }
       String text;
       try {

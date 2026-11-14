@@ -29,15 +29,9 @@ CCTV2,http://b/1.m3u8\$LR•IPV4『线路1』
   });
 
   group('LiveService 已知直播 UA', () {
-    test('live.ottiptv.cc 固定 okHttp/Mod-1.5.0.0（host 不区分大小写）', () {
-      expect(
-        LiveService.defaultUaLiveHost('live.ottiptv.cc'),
-        'okHttp/Mod-1.5.0.0',
-      );
-      expect(
-        LiveService.defaultUaLiveHost('LIVE.OTTIPTV.CC'),
-        'okHttp/Mod-1.5.0.0',
-      );
+    test('live.ottiptv.cc 固定 qqlive（host 不区分大小写）', () {
+      expect(LiveService.defaultUaLiveHost('live.ottiptv.cc'), 'qqlive');
+      expect(LiveService.defaultUaLiveHost('LIVE.OTTIPTV.CC'), 'qqlive');
       expect(LiveService.defaultUaLiveHost('other.example.com'), isNull);
     });
   });

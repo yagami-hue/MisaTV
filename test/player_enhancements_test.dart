@@ -63,13 +63,16 @@ void main() {
       expect(settings.artworkPriority, 'tmdb');
       expect(settings.tmdbApiKey, 'tmdb-key');
       expect(settings.bossKey, 'alt+q');
-      expect(PlayerSettings.fromJson({}).bossKey, kDefaultBossKey);
-      expect(
-        PlayerSettings.fromJson({'bossKey': 'bogus'}).bossKey,
-        'ctrl+shift+b',
-      );
-      expect(PlayerSettings.fromJson({'bossKey': 'OFF'}).bossKey, 'off');
+      // 默认不占用任何全局热键：只有用户显式选择才生效。
+      expect(PlayerSettings.fromJson({}).bossKey, kUnsetBossKey);
+      // 未知值不再回落到某个默认组合（那等于替用户抢一个热键）。
+      expect(PlayerSettings.fromJson({'bossKey': 'bogus'}).bossKey, kUnsetBossKey);
+      // 旧版本的 'off' 归一到「未设置」。
+      expect(PlayerSettings.fromJson({'bossKey': 'OFF'}).bossKey, kUnsetBossKey);
       expect(bossKeyLabel('f12'), 'F12');
+      expect(bossKeyLabel(kUnsetBossKey), '未设置');
+      expect(isBossKeySet(kUnsetBossKey), isFalse);
+      expect(isBossKeySet('f12'), isTrue);
       expect(settings.toJson()['bossKey'], 'alt+q');
       // TMDB 两个凭据各存各的：v3 Key 走 query、v4 Token 走 Authorization 头。
       final tmdb = PlayerSettings.fromJson({

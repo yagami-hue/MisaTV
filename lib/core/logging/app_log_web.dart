@@ -14,7 +14,8 @@ class AppLog {
 
   static Future<void> init({String? supportDir}) async {}
 
-  static void i(String tag, String message) => debugPrint('[I][$tag] $message');
+  static void i(String tag, String message) =>
+      debugPrint('[I][$tag] ${redactQueryValues(message)}');
 
   static void w(
     String tag,
@@ -22,7 +23,8 @@ class AppLog {
     Object? error,
     StackTrace? stack,
   ]) => debugPrint(
-    '[W][$tag] $message${error == null ? '' : ' | ${errorBrief(error)}'}',
+    '[W][$tag] ${redactQueryValues(message)}'
+    '${error == null ? '' : ' | ${errorBrief(error)}'}',
   );
 
   static void e(
@@ -31,7 +33,8 @@ class AppLog {
     Object? error,
     StackTrace? stack,
   ]) => debugPrint(
-    '[E][$tag] $message${error == null ? '' : ' | ${errorBrief(error)}'}',
+    '[E][$tag] ${redactQueryValues(message)}'
+    '${error == null ? '' : ' | ${errorBrief(error)}'}',
   );
 
   static Future<void> flush() async {}

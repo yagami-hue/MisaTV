@@ -47,7 +47,7 @@ class ProxyRuntime {
     return config.valid ? address : '跟随系统代理 → $address';
   }
 
-  /// 端口是否连得上（代理池里的公共节点大量失效，用前先探一下）。
+  /// 端口是否连得上（诊断时先探一下，避免把超时误判成代理可用）。
   Future<bool> isReachable(
     String host,
     int port, {

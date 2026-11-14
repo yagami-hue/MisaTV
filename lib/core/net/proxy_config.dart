@@ -8,7 +8,7 @@ import 'dart:convert';
 class ProxyConfig {
   const ProxyConfig({
     this.enabled = false,
-    this.followSystem = true,
+    this.followSystem = false,
     this.type = 'http',
     this.host = '',
     this.port = 0,
@@ -19,8 +19,8 @@ class ProxyConfig {
   /// 手动启用内置代理；true 时忽略 [followSystem]。
   final bool enabled;
 
-  /// 跟随系统代理（Windows 的「局域网设置」/ 环境变量）。默认开：
-  /// Dart 的 HttpClient 不会自己读系统代理，不跟随就只能干等到超时。
+  /// 跟随系统代理（Windows 的「局域网设置」/ 环境变量）。默认关：默认直连，
+  /// 需要走系统代理的用户在「网络代理」里手动打开。
   final bool followSystem;
 
   /// `http` 或 `socks5`。
@@ -83,10 +83,10 @@ class ProxyConfig {
     final type = (json['type'] ?? 'http').toString().toLowerCase();
     return ProxyConfig(
       enabled: json['enabled'] == true,
-      // 老配置没有这个键：按「跟随系统代理」处理（默认行为）。
+      // 老配置没有这个键：按「直连」处理（新的默认行为）。
       followSystem: json['followSystem'] is bool
           ? json['followSystem'] == true
-          : true,
+          : false,
       type: type == 'socks5' ? 'socks5' : 'http',
       host: (json['host'] ?? '').toString().trim(),
       port: port,

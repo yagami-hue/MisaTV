@@ -5,6 +5,7 @@ import 'dart:typed_data';
 import 'package:gbk_codec/gbk_codec.dart';
 import 'package:http/http.dart' as http;
 
+import '../errors/app_error.dart';
 import '../logging/app_log.dart';
 import '../logging/log_redact.dart';
 import '../../services/relay/proxy_rules.dart';
@@ -49,6 +50,12 @@ String parseSetCookieHeader(String raw) {
 
 class AppHttp {
   AppHttp({http.Client? client}) : _client = client ?? http.Client();
+
+  /// 请求观察者（蜘蛛调试用）：设置后每次发出请求前回调一次。
+  ///
+  /// 只覆盖走 [AppHttp] 的请求；JS 蜘蛛的 curl 子进程、jar 蜘蛛的 OkHttp
+  /// 不经过这里，调试面板不会列出它们 —— 这是刻意的限制，不要假装能看全。
+  static void Function(String method, String url)? observer;
 
   final http.Client _client;
   http.Client? _dohClient;
@@ -124,6 +131,7 @@ class AppHttp {
       throw AppHttpException('无效的地址：$url');
     }
     final client = useDoh ? (_dohClient ??= createDohClient()) : _client;
+    observer?.call('GET', normalized);
     try {
       final res = await client
           .get(uri, headers: {..._defaultHeaders, ...?headers})
@@ -151,7 +159,7 @@ class AppHttp {
       // 异常文本里可能带完整 URL（含 ?api_key=…），落盘前先给 query 值打码。
       final detail = redactQueryValues(e.toString());
       AppLog.w('http', 'GET ${redactUrl(normalized)} 失败', detail);
-      throw AppHttpException('网络请求失败：$detail');
+      throw AppHttpException(describeAppError(e).message);
     }
   }
 
@@ -180,6 +188,7 @@ class AppHttp {
         ..headers.addAll({..._defaultHeaders, ...?headers})
         ..followRedirects = true;
       final client = useDoh ? (_dohClient ??= createDohClient()) : _client;
+      observer?.call('GET', normalized);
       final res = await client.send(request).timeout(timeout);
       final setCookie = res.headers['set-cookie'];
       if (setCookie != null) _captureCookies(uri, setCookie);
@@ -231,6 +240,7 @@ class AppHttp {
       throw AppHttpException('无效的地址：$url');
     }
     try {
+      observer?.call('POST', normalized);
       final res = await _client
           .post(
             uri,
@@ -266,7 +276,7 @@ class AppHttp {
     } catch (e) {
       final detail = redactQueryValues(e.toString());
       AppLog.w('http', 'POST ${redactUrl(normalized)} 失败', detail);
-      throw AppHttpException('网络请求失败：$detail');
+      throw AppHttpException(describeAppError(e).message);
     }
   }
 
@@ -283,6 +293,7 @@ class AppHttp {
       throw AppHttpException('无效的地址：$url');
     }
     try {
+      observer?.call('POST', normalized);
       final res = await _client
           .post(
             uri,
@@ -318,7 +329,7 @@ class AppHttp {
     } catch (e) {
       final detail = redactQueryValues(e.toString());
       AppLog.w('http', 'POST ${redactUrl(normalized)} 失败', detail);
-      throw AppHttpException('网络请求失败：$detail');
+      throw AppHttpException(describeAppError(e).message);
     }
   }
 

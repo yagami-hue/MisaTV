@@ -112,7 +112,11 @@ class JarSpiderHost {
     try {
       await _process.exitCode.timeout(const Duration(seconds: 2));
     } catch (_) {}
-    await _errSub?.cancel();
+    // 取消流订阅必须带超时：JVM 被 kill 后管道仍可能挂着未读完的数据，
+    // 无超时的 cancel() 会永远等下去，把「开始退出清理」卡死在这里。
+    try {
+      await _errSub?.cancel().timeout(const Duration(milliseconds: 500));
+    } catch (_) {}
   }
 
   static String describe(List<String> errors) {
@@ -300,8 +304,13 @@ class JarServeHost {
     try {
       await _process.exitCode.timeout(const Duration(seconds: 2));
     } catch (_) {}
-    await _outSub?.cancel();
-    await _errSub?.cancel();
+    // 同上：流订阅的 cancel 可能挂住，必须限时。
+    try {
+      await _outSub?.cancel().timeout(const Duration(milliseconds: 500));
+    } catch (_) {}
+    try {
+      await _errSub?.cancel().timeout(const Duration(milliseconds: 500));
+    } catch (_) {}
   }
 }
 

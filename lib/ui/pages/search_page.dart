@@ -5,11 +5,13 @@ import 'package:flutter/material.dart';
 import '../../app.dart';
 import '../../models/site_config.dart';
 import '../../models/vod.dart';
+import '../../services/matching/title_matching.dart';
 import '../../state/app_state.dart';
 import '../widgets/empty_state.dart';
 import '../widgets/glass.dart';
 import '../widgets/import_sheet.dart';
 import '../widgets/poster_card.dart';
+import '../widgets/source_variants_sheet.dart';
 import 'detail_page.dart';
 
 class SearchPage extends StatefulWidget {
@@ -108,6 +110,50 @@ class _SearchPageState extends State<SearchPage> {
     final text = _controller.text;
     final at = text.lastIndexOf('@');
     return at < 0 ? '' : text.substring(at + 1);
+  }
+
+  /// 同名跨源候选：用 `sourceItems`（未去重原始结果）按片名 + 年份归组。
+  ///
+  /// 合并结果只保留一条代表条目，`sourceItems` 里才有其它源的原始 id，
+  /// 换源进详情时必须用后者，否则会把 A 源的 id 带到 B 源。
+  List<VodItem> _variantsFor(VodItem item) {
+    final progress = _progress;
+    if (progress == null) return [item];
+    final key = searchDedupeKey(item.name, year: item.year);
+    final out = <VodItem>[];
+    final seen = <String>{};
+    for (final list in progress.sourceItems.values) {
+      for (final candidate in list) {
+        if (searchDedupeKey(candidate.name, year: candidate.year) != key) {
+          continue;
+        }
+        final id = '${candidate.sourceKey}\u0000${candidate.id}';
+        if (seen.add(id)) out.add(candidate);
+      }
+    }
+    if (out.isEmpty) return [item];
+    out.sort((a, b) {
+      final bySource = a.sourceName.compareTo(b.sourceName);
+      if (bySource != 0) return bySource;
+      return a.remarks.compareTo(b.remarks);
+    });
+    return out;
+  }
+
+  void _showVariants(VodItem item) {
+    final variants = _variantsFor(item);
+    if (variants.length <= 1) return;
+    showSourceVariantsSheet(
+      context,
+      variants: variants,
+      currentSourceKey: item.sourceKey,
+      onOpen: (picked) {
+        if (!mounted) return;
+        Navigator.of(context).push(
+          MaterialPageRoute(builder: (_) => DetailPage(item: picked)),
+        );
+      },
+    );
   }
 
   void _onFocusChanged() {
@@ -586,7 +632,7 @@ class _SearchPageState extends State<SearchPage> {
                               }
                             },
                             decoration: InputDecoration(
-                              hintText: '搜索电影、剧集、动漫…；输入 @ 指定站点',
+                              hintText: '搜索电影、剧集、动漫…；@ 指定站点，year:/type:/area: 过滤，-词 排除',
                               prefixIcon: const Icon(Icons.search_rounded),
                               suffixIcon: _controller.text.isEmpty
                                   ? null
@@ -810,6 +856,9 @@ class _SearchPageState extends State<SearchPage> {
                           showSource: true,
                           onSecondaryLongPress: () =>
                               app.requestSearch(item.name),
+                          onShowSources: item.sameFromOtherSources > 0
+                              ? () => _showVariants(item)
+                              : null,
                           onTap: () {
                             _hideSourceOverlay();
                             if (app.isDoubanSourceKey(item.sourceKey)) {
@@ -905,6 +954,7 @@ class _ProgressPanel extends StatelessWidget {
                   searching
                       ? '正在搜索「$keyword」 · ${progress.done}/${progress.total}$filterLabel'
                       : '「$keyword」找到 $visibleCount 条结果$filterLabel'
+                            '${progress.filterSummary.isEmpty ? '' : ' · ${progress.filterSummary}'}'
                             '${hidden > 0 ? ' · 已屏蔽 $hidden 条' : ''}',
                   style: theme.textTheme.bodySmall?.copyWith(
                     fontWeight: FontWeight.w600,

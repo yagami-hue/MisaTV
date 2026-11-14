@@ -13,6 +13,7 @@ import '../widgets/empty_state.dart';
 import '../widgets/mouse_drag_scroll.dart';
 import '../widgets/glass.dart';
 import '../widgets/hover_marquee_text.dart';
+import '../widgets/live_catchup_sheet.dart';
 
 class LivePage extends StatefulWidget {
   const LivePage({super.key});
@@ -28,6 +29,7 @@ class _LivePageState extends State<LivePage> {
   String? _error;
   List<LiveGroup> _groups = const [];
   Map<String, EpgEntry> _epg = const {};
+  Map<String, List<EpgProgram>> _programs = const {};
   int _epgSeq = 0;
   Timer? _epgTimer;
 
@@ -72,6 +74,7 @@ class _LivePageState extends State<LivePage> {
       _error = null;
       _groups = const [];
       _epg = const {};
+      _programs = const {};
       _groupIndex = 0;
     });
     try {
@@ -102,18 +105,24 @@ class _LivePageState extends State<LivePage> {
   }) async {
     final app = AppScope.of(context);
     final seq = ++_epgSeq;
-    Map<String, EpgEntry> epg = const {};
+    Map<String, List<EpgProgram>> programs = const {};
     try {
-      epg = await app.epgService.loadFor(
+      programs = await app.epgService.loadProgramsFor(
         bean: bean,
         channels: groups.expand((g) => g.channels).toList(),
         refresh: refresh,
       );
     } catch (_) {
-      epg = const {};
+      programs = const {};
     }
     if (!mounted || seq != _epgSeq) return;
-    setState(() => _epg = epg);
+    final epg = programs.isEmpty
+        ? const <String, EpgEntry>{}
+        : buildEpgEntries(programs, DateTime.now().millisecondsSinceEpoch);
+    setState(() {
+      _programs = programs;
+      _epg = epg;
+    });
     _scheduleEpgRefresh(bean, groups, epg);
   }
 
@@ -364,6 +373,7 @@ class _LivePageState extends State<LivePage> {
                           groups: _groups,
                           groupIndex: _groupIndex,
                           epg: _epg,
+                          programs: _programs,
                           onGroup: (i) => setState(() => _groupIndex = i),
                           onPlay: (channel, line) => _play(
                             context,
@@ -371,11 +381,13 @@ class _LivePageState extends State<LivePage> {
                             channel,
                             line,
                           ),
+                          onCatchup: _openCatchup,
                         )
                       : _DesktopBody(
                           groups: _groups,
                           groupIndex: _groupIndex,
                           epg: _epg,
+                          programs: _programs,
                           onGroup: (i) => setState(() => _groupIndex = i),
                           group: group!,
                           onPlay: (channel, line) => _play(
@@ -384,6 +396,7 @@ class _LivePageState extends State<LivePage> {
                             channel,
                             line,
                           ),
+                          onCatchup: _openCatchup,
                         ),
                 ),
               ],
@@ -393,6 +406,15 @@ class _LivePageState extends State<LivePage> {
       },
     );
   }
+
+  Future<void> _openCatchup(
+    LiveChannel channel,
+    List<EpgProgram> programs,
+  ) => showLiveCatchupSheet(
+    context,
+    channel: channel,
+    programs: programs,
+  );
 
   Future<void> _play(
     BuildContext context,
@@ -422,17 +444,21 @@ class _DesktopBody extends StatelessWidget {
     required this.groups,
     required this.groupIndex,
     required this.epg,
+    required this.programs,
     required this.onGroup,
     required this.group,
     required this.onPlay,
+    required this.onCatchup,
   });
 
   final List<LiveGroup> groups;
   final int groupIndex;
   final Map<String, EpgEntry> epg;
+  final Map<String, List<EpgProgram>> programs;
   final ValueChanged<int> onGroup;
   final LiveGroup group;
   final void Function(LiveChannel, LiveLine) onPlay;
+  final void Function(LiveChannel, List<EpgProgram>) onCatchup;
 
   @override
   Widget build(BuildContext context) {
@@ -497,7 +523,9 @@ class _DesktopBody extends StatelessWidget {
           child: _ChannelGrid(
             channels: group.channels,
             epg: epg,
+            programs: programs,
             onPlay: onPlay,
+            onCatchup: onCatchup,
           ),
         ),
       ],
@@ -510,15 +538,19 @@ class _MobileBody extends StatelessWidget {
     required this.groups,
     required this.groupIndex,
     required this.epg,
+    required this.programs,
     required this.onGroup,
     required this.onPlay,
+    required this.onCatchup,
   });
 
   final List<LiveGroup> groups;
   final int groupIndex;
   final Map<String, EpgEntry> epg;
+  final Map<String, List<EpgProgram>> programs;
   final ValueChanged<int> onGroup;
   final void Function(LiveChannel, LiveLine) onPlay;
+  final void Function(LiveChannel, List<EpgProgram>) onCatchup;
 
   @override
   Widget build(BuildContext context) {
@@ -553,7 +585,9 @@ class _MobileBody extends StatelessWidget {
           child: _ChannelGrid(
             channels: group.channels,
             epg: epg,
+            programs: programs,
             onPlay: onPlay,
+            onCatchup: onCatchup,
             padding: const EdgeInsets.fromLTRB(18, 4, 18, 18),
           ),
         ),
@@ -566,12 +600,16 @@ class _ChannelGrid extends StatelessWidget {
   const _ChannelGrid({
     required this.channels,
     required this.epg,
+    required this.programs,
     required this.onPlay,
+    required this.onCatchup,
     this.padding = const EdgeInsets.fromLTRB(10, 4, 28, 28),
   });
   final List<LiveChannel> channels;
   final Map<String, EpgEntry> epg;
+  final Map<String, List<EpgProgram>> programs;
   final void Function(LiveChannel, LiveLine) onPlay;
+  final void Function(LiveChannel, List<EpgProgram>) onCatchup;
   final EdgeInsetsGeometry padding;
 
   @override
@@ -588,10 +626,15 @@ class _ChannelGrid extends StatelessWidget {
       itemBuilder: (context, index) {
         final channel = channels[index];
         final lines = channelLines(channel);
+        final programsOf =
+            lookupEpg(programs, epgRefOf(channel)) ?? const <EpgProgram>[];
         return _ChannelTile(
           channel: channel,
           lineCount: lines.length,
           epg: entryOf(epg, epgRefOf(channel)),
+          onSchedule: programsOf.isEmpty
+              ? null
+              : () => onCatchup(channel, programsOf),
           onTap: () {
             if (lines.isEmpty) return;
             // 多条线路时默认起播源 1；其余线路在播放器顶栏的「N 条线路」里切换。
@@ -609,11 +652,13 @@ class _ChannelTile extends StatefulWidget {
     required this.lineCount,
     required this.epg,
     required this.onTap,
+    this.onSchedule,
   });
   final LiveChannel channel;
   final int lineCount;
   final EpgEntry? epg;
   final VoidCallback onTap;
+  final VoidCallback? onSchedule;
 
   @override
   State<_ChannelTile> createState() => _ChannelTileState();
@@ -704,6 +749,18 @@ class _ChannelTileState extends State<_ChannelTile> {
                 ],
               ),
             ),
+            if (widget.onSchedule != null)
+              IconButton(
+                tooltip: '节目单 / 回看',
+                onPressed: widget.onSchedule,
+                icon: const Icon(Icons.schedule_rounded, size: 18),
+                visualDensity: VisualDensity.compact,
+                padding: EdgeInsets.zero,
+                constraints: const BoxConstraints(
+                  minWidth: 28,
+                  minHeight: 28,
+                ),
+              ),
             const Icon(Icons.play_arrow_rounded, size: 20),
           ],
         ),

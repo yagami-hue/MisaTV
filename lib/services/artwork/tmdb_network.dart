@@ -39,8 +39,8 @@ String describeTmdbDns({
   }
   if (usable.isEmpty) {
     return '当前网络把 api.themoviedb.org 解析到 ${addresses.take(2).join('、')}（Facebook/保留地址，典型 DNS 污染），'
-        '直连必然超时。请在 Clash / v2rayN 打开「系统代理」（应用会自动跟随），'
-        '或在 设置 → 播放 → 网络代理 里手动填代理端口。';
+        '直连必然超时。请在 Clash / v2rayN 打开「系统代理」后到 设置 → 播放 → 网络代理 开启「跟随系统代理」，'
+        '或直接填写手动代理端口。';
   }
   return '解析到 ${usable.take(2).join('、')}，域名本身没被污染；若仍超时请检查代理是否在运行。';
 }

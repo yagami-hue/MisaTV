@@ -41,14 +41,28 @@ class BossKeyService {
           defaultTargetPlatform == TargetPlatform.macOS);
 
   /// 启动时接好托盘与全局热键；失败只记日志，不影响正常使用。
+  ///
+  /// 调用方必须保证此时窗口与消息循环已就绪（见 main.dart 的首帧回调）。
   Future<void> init(AppState app) async {
     if (!_desktop) return;
     _app = app;
-    _initTray();
-    await applyBossKey(app.playerSettings.bossKey);
+    // 托盘与热键互不影响：任一失败都不该拖垮启动。
+    try {
+      _initTray();
+    } catch (e) {
+      AppLog.w('boss', '托盘初始化异常（忽略）：$e');
+    }
+    try {
+      await applyBossKey(app.playerSettings.bossKey);
+    } catch (e) {
+      AppLog.w('boss', '老板键初始化异常（忽略）：$e');
+    }
   }
 
   /// 更换老板键（设置页保存后调用）。返回是否注册成功。
+  ///
+  /// **只有用户显式选择的组合才会被注册**。未设置（空串）时直接释放旧热键，
+  /// 不占用任何全局组合——不替用户做决定，也避免与常用软件抢键。
   Future<bool> applyBossKey(String raw) async {
     if (!_desktop) return false;
     final value = normalizeBossKey(raw);
@@ -63,13 +77,18 @@ class BossKeyService {
         // 旧键可能已经失效，继续注册新键。
       }
     }
-    _tray?.setTooltip('MisaTV · 老板键 ${bossKeyLabel(value)}');
-    if (value == 'off') {
-      AppLog.i('boss', '老板键已关闭');
+    _tray?.setTooltip(_tooltipText());
+    // 未设置：什么都不注册，这是正常状态而不是失败。
+    if (!isBossKeySet(value)) {
+      AppLog.i('boss', '老板键未设置（不占用全局热键）');
       return true;
     }
     final hotKey = _hotKeyFor(value);
-    if (hotKey == null) return false;
+    if (hotKey == null) {
+      lastHotKeyError = '不支持的组合：${bossKeyLabel(value)}';
+      AppLog.w('boss', lastHotKeyError);
+      return false;
+    }
     try {
       await hotKeyManager.register(
         hotKey,
@@ -79,10 +98,32 @@ class BossKeyService {
       AppLog.i('boss', '老板键已注册：${bossKeyLabel(value)}');
       return true;
     } catch (e) {
-      lastHotKeyError = '$e';
+      // 冲突是最常见的失败原因（组合已被其它软件占用）。把原因留给设置页显示，
+      // 不要让用户以为「设置成功但按了没反应」。
+      lastHotKeyError = _describeRegisterFailure(e, value);
       AppLog.w('boss', '老板键注册失败（${bossKeyLabel(value)}）：$e');
       return false;
     }
+  }
+
+  /// 把注册异常翻译成用户能看懂的说明。
+  String _describeRegisterFailure(Object error, String value) {
+    final text = '$error';
+    final label = bossKeyLabel(value);
+    if (text.contains('register_failed') || text.contains('RegisterHotKey')) {
+      return '$label 已被其它程序占用，请换一个组合';
+    }
+    return '$label 注册失败：$text';
+  }
+
+  /// 托盘提示：未设置时也要说清楚，而不是显示一个假的组合。
+  String _tooltipText() {
+    final value = _activeBossKey;
+    if (!isBossKeySet(value)) return 'MisaTV';
+    if (lastHotKeyError.isNotEmpty) {
+      return 'MisaTV · ${bossKeyLabel(value)}（不可用）';
+    }
+    return 'MisaTV · 老板键 ${bossKeyLabel(value)}';
   }
 
   /// 热键回调：沉浸观影模式直接忽略，按住不放产生的重复事件只认第一次。
@@ -169,7 +210,7 @@ class BossKeyService {
       if (icon == null) return;
       _tray = icon;
       icon.icon = ImageAsset.fromAsset('assets/images/app_icon.png');
-      icon.setTooltip('MisaTV · 老板键 ${bossKeyLabel(_app?.playerSettings.bossKey ?? kDefaultBossKey)}');
+      icon.setTooltip(_tooltipText());
 
       final menu = Menu.create();
       if (menu != null) {
@@ -213,8 +254,15 @@ class BossKeyService {
           unawaited(restore());
         }
       });
-      icon.setVisible(true);
-      AppLog.i('boss', '托盘图标已创建');
+      // 原生托盘可能在窗口 / 消息循环未就绪时失败，而 setVisible 只返回 bool、
+      // 不抛异常。以前直接丢弃返回值，日志永远写「托盘图标已创建」，
+      // 崩溃现场就变成「看起来成功然后进程消失」。现在按真实结果记日志。
+      final visible = icon.setVisible(true);
+      if (visible) {
+        AppLog.i('boss', '托盘图标已创建');
+      } else {
+        AppLog.w('boss', '托盘图标创建失败：setVisible 返回 false（窗口或消息循环未就绪）');
+      }
     } catch (e) {
       AppLog.w('boss', '托盘图标创建失败：$e');
     }
@@ -224,16 +272,21 @@ class BossKeyService {
     final key = switch (value) {
       'ctrl+shift+b' => LogicalKeyboardKey.keyB,
       'ctrl+alt+b' => LogicalKeyboardKey.keyB,
+      'ctrl+shift+f' => LogicalKeyboardKey.keyF,
       'alt+q' => LogicalKeyboardKey.keyQ,
       'alt+x' => LogicalKeyboardKey.keyX,
+      'alt+z' => LogicalKeyboardKey.keyZ,
       'f12' => LogicalKeyboardKey.f12,
       _ => null,
     };
     if (key == null) return null;
     final modifiers = switch (value) {
-      'ctrl+shift+b' => [HotKeyModifier.control, HotKeyModifier.shift],
+      'ctrl+shift+b' || 'ctrl+shift+f' => [
+        HotKeyModifier.control,
+        HotKeyModifier.shift,
+      ],
       'ctrl+alt+b' => [HotKeyModifier.control, HotKeyModifier.alt],
-      'alt+q' || 'alt+x' => [HotKeyModifier.alt],
+      'alt+q' || 'alt+x' || 'alt+z' => [HotKeyModifier.alt],
       _ => const <HotKeyModifier>[],
     };
     return HotKey(

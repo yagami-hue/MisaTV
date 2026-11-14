@@ -28,6 +28,45 @@ class _ImportSheet extends StatefulWidget {
   State<_ImportSheet> createState() => _ImportSheetState();
 }
 
+class _PreviewStat extends StatelessWidget {
+  const _PreviewStat({
+    required this.label,
+    required this.value,
+    required this.color,
+  });
+
+  final String label;
+  final int value;
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.10),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: color.withValues(alpha: 0.24)),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(
+            '$value',
+            style: theme.textTheme.titleSmall?.copyWith(
+              fontWeight: FontWeight.w800,
+              color: color,
+            ),
+          ),
+          const SizedBox(width: 6),
+          Text(label, style: theme.textTheme.labelSmall),
+        ],
+      ),
+    );
+  }
+}
+
 class _ImportSheetState extends State<_ImportSheet>
     with SingleTickerProviderStateMixin {
   late final TabController _tabs = TabController(length: 2, vsync: this);
@@ -35,6 +74,7 @@ class _ImportSheetState extends State<_ImportSheet>
   final _json = TextEditingController();
   final _name = TextEditingController();
   bool _loading = false;
+  bool _previewBeforeImport = true;
   String? _error;
 
   @override
@@ -54,9 +94,23 @@ class _ImportSheetState extends State<_ImportSheet>
     });
     final app = AppScope.of(context);
     try {
-      final outcome = fromUrl
-          ? await app.importFromUrl(_url.text, name: _name.text)
-          : await app.importFromJson(_json.text, name: _name.text);
+      final ImportOutcome outcome;
+      if (_previewBeforeImport) {
+        final preview = fromUrl
+            ? await app.previewImportFromUrl(_url.text, name: _name.text)
+            : await app.previewImportText(_json.text, name: _name.text);
+        if (!mounted) return;
+        final confirmed = await _confirmPreview(preview);
+        if (confirmed != true) {
+          if (mounted) setState(() => _loading = false);
+          return;
+        }
+        outcome = await app.commitImportPreview(preview);
+      } else {
+        outcome = fromUrl
+            ? await app.importFromUrl(_url.text, name: _name.text)
+            : await app.importFromJson(_json.text, name: _name.text);
+      }
       if (!mounted) return;
       Navigator.of(context).pop(outcome);
     } catch (e) {
@@ -66,6 +120,85 @@ class _ImportSheetState extends State<_ImportSheet>
         _error = e.toString();
       });
     }
+  }
+
+  Future<bool?> _confirmPreview(ImportPreview preview) {
+    final theme = Theme.of(context);
+    return showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('导入预览'),
+        content: SizedBox(
+          width: 480,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                preview.name,
+                style: theme.textTheme.titleMedium?.copyWith(
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+              const SizedBox(height: 6),
+              Text(
+                '点播源 ${preview.siteCount} 个 · 直播源 ${preview.liveCount} 条',
+                style: theme.textTheme.bodySmall,
+              ),
+              const SizedBox(height: 12),
+              Wrap(
+                spacing: 10,
+                runSpacing: 8,
+                children: [
+                  _PreviewStat(
+                    label: '新增',
+                    value: preview.added,
+                    color: theme.colorScheme.primary,
+                  ),
+                  _PreviewStat(
+                    label: '删除',
+                    value: preview.removed,
+                    color: theme.colorScheme.error,
+                  ),
+                  _PreviewStat(
+                    label: '修改',
+                    value: preview.changed,
+                    color: theme.colorScheme.tertiary,
+                  ),
+                ],
+              ),
+              if (preview.warnings.isNotEmpty) ...[
+                const SizedBox(height: 12),
+                Text(
+                  preview.warnings.take(3).join('\n'),
+                  style: theme.textTheme.labelSmall?.copyWith(
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
+                ),
+              ],
+              const SizedBox(height: 12),
+              Text(
+                '变更数量以当前点播订阅为基准；确认后才写入本地，取消不会改动现有配置。',
+                style: theme.textTheme.labelSmall?.copyWith(
+                  color: theme.colorScheme.onSurface.withValues(alpha: 0.62),
+                  height: 1.5,
+                ),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('确认导入'),
+          ),
+        ],
+      ),
+    );
   }
 
   Future<void> _importLocal({required bool py}) async {
@@ -219,6 +352,16 @@ class _ImportSheetState extends State<_ImportSheet>
                           hintText: '例如：我的订阅',
                           prefixIcon: Icon(Icons.label_outline_rounded),
                         ),
+                      ),
+                      SwitchListTile(
+                        contentPadding: EdgeInsets.zero,
+                        value: _previewBeforeImport,
+                        onChanged: _loading
+                            ? null
+                            : (value) =>
+                                  setState(() => _previewBeforeImport = value),
+                        title: const Text('导入前预览变更'),
+                        subtitle: const Text('先对比当前订阅新增 / 删除 / 修改的源，确认后再落盘'),
                       ),
                       const SizedBox(height: 14),
                       TabBar(

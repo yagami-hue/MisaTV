@@ -36,8 +36,13 @@ String shorten(String text, [int max = 400]) {
 }
 
 /// 只保留异常类型 + 首行信息，避免把整段堆栈塞进单行消息。
+///
+/// 异常文本经常带完整请求地址（`ClientException ... uri=https://x/?api_key=…`），
+/// 这里同时把 query 值打码，保证所有落盘入口都拿不到明文凭据。
 String errorBrief(Object? error) {
   if (error == null) return '';
-  final text = error.toString().replaceAll('\n', ' ').trim();
+  final text = redactQueryValues(
+    error.toString().replaceAll('\n', ' ').trim(),
+  );
   return shorten(text, 300);
 }

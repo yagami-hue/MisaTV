@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -34,9 +35,20 @@ class StreamDiskCache {
 
   /// 最近一次命中的时间：淘汰按它排序，避免每次都 stat 整个目录。
   final Map<String, DateTime> _touched = {};
+
+  /// 条目 Content-Type：命中是高频路径，首次读 `.json` 后缓存在内存里，
+  /// 后续不再为每个分片多做两次磁盘 IO。
+  final Map<String, String> _types = {};
+
+  /// 已经确认存在的分片目录，避免每个分片都 create 一次。
+  final Set<String> _readyDirs = {};
+
   int _bytes = 0;
   bool _indexed = false;
   String _indexedDir = '';
+
+  /// 正在后台构建的索引；`null` = 没有进行中的扫描。
+  Future<void>? _indexing;
 
   /// 缓存键：地址的 sha1。分片地址通常自带签名、随清单变化，直接哈希即可。
   static String keyOf(String url) => sha1.convert(utf8.encode(url)).toString();
@@ -48,22 +60,48 @@ class StreamDiskCache {
     return File('$dir${_sep()}$shard${_sep()}$key');
   }
 
+  /// `downloads/` 是播放器「下载视频」的落盘目录：它和缓存共用同一个根路径，
+  /// 但不参与 LRU 淘汰，也不会被「清空播放缓存」删掉。
+  String get _downloadsDir => '$dir${_sep()}downloads';
+  String get _downloadsPrefix => '$_downloadsDir${_sep()}';
+
   File _meta(String key) => File('${_entry(key).path}.json');
 
-  Future<void> _ensureIndex() async {
-    if (_indexed && _indexedDir == dir) return;
-    _indexed = true;
-    _indexedDir = dir;
-    _sizes.clear();
-    _touched.clear();
-    _bytes = 0;
-    if (dir.isEmpty) return;
-    final root = Directory(dir);
-    if (!await root.exists()) return;
+  /// 后台预热索引：应用启动后就把目录扫完，首个分片不必再等这次扫描。
+  ///
+  /// 扫描期间的请求不再阻塞等待（见 [open]），最多是暂时不参与淘汰。
+  void warmUp() {
+    if (dir.isEmpty || _indexed) return;
+    unawaited(_ensureIndex());
+  }
+
+  Future<void> _ensureIndex() {
+    if (dir.isEmpty || (_indexed && _indexedDir == dir)) {
+      return Future<void>.value();
+    }
+    final pending = _indexing;
+    if (pending != null) return pending;
+    final task = _buildIndex();
+    _indexing = task;
+    return task;
+  }
+
+  Future<void> _buildIndex() async {
     try {
+      _sizes.clear();
+      _touched.clear();
+      _bytes = 0;
+      _indexedDir = dir;
+      final root = Directory(dir);
+      if (!await root.exists()) {
+        _indexed = true;
+        return;
+      }
       await for (final entity in root.list(recursive: true)) {
         if (entity is! File) continue;
         final path = entity.path;
+        // 下载目录与缓存共用根路径，但不能被当成缓存条目索引 / 淘汰。
+        if (path.startsWith(_downloadsPrefix)) continue;
         if (path.endsWith('.tmp')) {
           // 上次进程被杀留下的半截文件
           try {
@@ -72,40 +110,42 @@ class StreamDiskCache {
           continue;
         }
         if (path.endsWith('.json')) continue;
+        // 扫描期间可能已经有新分片落盘：不要重复计入。
+        if (_sizes.containsKey(path)) continue;
         try {
           final stat = await entity.stat();
           if (stat.size <= 0) continue;
           _sizes[path] = stat.size;
-          _touched[path] = stat.modified;
+          _touched[path] = _touched[path] ?? stat.modified;
           _bytes += stat.size;
         } catch (_) {}
       }
-    } catch (_) {}
+      _indexed = true;
+    } catch (_) {
+      // 目录不可读时保留已扫到的部分；标记为已索引，避免每个分片都重扫一遍。
+      _indexed = true;
+    } finally {
+      _indexing = null;
+    }
   }
 
   /// 命中则返回可读条目，并把 mtime 刷新（LRU 不误删仍在用的分片）。
   Future<StreamCacheEntry?> lookup(String key) async {
     if (dir.isEmpty || !enabled()) return null;
-    await _ensureIndex();
     final file = _entry(key);
     try {
-      if (!await file.exists()) return null;
+      // 直接 stat：存在 + 大小一次拿到，失败即未命中。
       final stat = await file.stat();
+      if (stat.type != FileSystemEntityType.file) return null;
       if (stat.size <= 0) {
-        await _drop(file);
+        _drop(file.path);
         return null;
       }
-      var contentType = 'application/octet-stream';
-      try {
-        final metaFile = _meta(key);
-        if (await metaFile.exists()) {
-          final decoded = jsonDecode(await metaFile.readAsString());
-          if (decoded is Map && decoded['type'] is String) {
-            final type = (decoded['type'] as String).trim();
-            if (type.isNotEmpty) contentType = type;
-          }
-        }
-      } catch (_) {}
+      var contentType = _types[file.path];
+      if (contentType == null) {
+        contentType = await _readContentType(key);
+        _types[file.path] = contentType;
+      }
       // 只更新内存里的访问时间：命中是高频路径，不该每次都写盘。
       _touched[file.path] = DateTime.now();
       return StreamCacheEntry(
@@ -118,6 +158,17 @@ class StreamDiskCache {
     }
   }
 
+  Future<String> _readContentType(String key) async {
+    try {
+      final decoded = jsonDecode(await _meta(key).readAsString());
+      if (decoded is Map && decoded['type'] is String) {
+        final type = (decoded['type'] as String).trim();
+        if (type.isNotEmpty) return type;
+      }
+    } catch (_) {}
+    return 'application/octet-stream';
+  }
+
   /// 未命中时开一个写入口；返回 null 表示这次响应不进缓存。
   Future<StreamCacheWriter?> open(
     String key, {
@@ -126,11 +177,21 @@ class StreamDiskCache {
   }) async {
     if (dir.isEmpty || !enabled()) return null;
     if (length <= 0 || length > maxEntryBytes) return null;
-    await _ensureIndex();
-    await _evictFor(length);
+    if (_indexed) {
+      // 索引已就绪：淘汰只动内存记账，文件删除异步进行，不占取流路径。
+      _evictFor(length);
+    } else {
+      // 首次启用 / 刚启动：后台补索引，本次分片先照常落盘。
+      // 若在这里 await 整目录扫描，首片会被拖住几百毫秒到数秒。
+      unawaited(_ensureIndex());
+    }
     final entry = _entry(key);
     try {
-      await entry.parent.create(recursive: true);
+      final parent = entry.parent;
+      if (!_readyDirs.contains(parent.path)) {
+        await parent.create(recursive: true);
+        _readyDirs.add(parent.path);
+      }
       final tmp = File('${entry.path}.tmp');
       if (await tmp.exists()) await tmp.delete();
       return StreamCacheWriter._(
@@ -140,14 +201,13 @@ class StreamDiskCache {
         tmp: tmp,
         sink: tmp.openWrite(),
         contentType: contentType,
-        length: length,
       );
     } catch (_) {
       return null;
     }
   }
 
-  Future<void> _evictFor(int incoming) async {
+  void _evictFor(int incoming) {
     final limit = limitMb() * 1024 * 1024;
     if (limit <= 0 || _bytes + incoming <= limit) return;
     // 按内存里记录的访问时间排序，不再逐个 stat 文件 —— 这一步在每个分片
@@ -163,15 +223,20 @@ class StreamDiskCache {
       });
     for (final path in paths) {
       if (_bytes + incoming <= limit) break;
-      await _drop(File(path));
+      _drop(path);
     }
   }
 
-  Future<void> _drop(File file) async {
-    final size = _sizes[file.path];
-    _sizes.remove(file.path);
-    _touched.remove(file.path);
+  /// 从索引里移除一条：记账同步完成，删文件异步进行。
+  void _drop(String path) {
+    final size = _sizes.remove(path);
+    _touched.remove(path);
+    _types.remove(path);
     if (size != null) _bytes -= size;
+    unawaited(_deleteEntry(File(path)));
+  }
+
+  Future<void> _deleteEntry(File file) async {
     try {
       await file.delete();
     } catch (_) {}
@@ -180,26 +245,37 @@ class StreamDiskCache {
     } catch (_) {}
   }
 
-  void _put(String path, int length) {
+  void _put(String path, int length, String contentType) {
     final old = _sizes[path];
     if (old != null) _bytes -= old;
     _sizes[path] = length;
     _touched[path] = DateTime.now();
+    _types[path] = contentType;
     _bytes += length;
   }
 
-  /// 清空缓存目录（设置页的「清空缓存」）。
+  /// 清空缓存目录（设置页的「清空缓存」）。保留下载视频目录。
   Future<void> clear() async {
     if (dir.isEmpty) return;
     final root = Directory(dir);
     try {
-      if (await root.exists()) await root.delete(recursive: true);
+      if (await root.exists()) {
+        await for (final entity in root.list()) {
+          if (entity is Directory && entity.path == _downloadsDir) continue;
+          try {
+            await entity.delete(recursive: true);
+          } catch (_) {}
+        }
+      }
     } catch (_) {}
     _sizes.clear();
     _touched.clear();
+    _types.clear();
+    _readyDirs.clear();
     _bytes = 0;
     _indexed = true;
     _indexedDir = dir;
+    _indexing = null;
   }
 
   /// 当前占用字节数（设置页展示用）。
@@ -207,6 +283,13 @@ class StreamDiskCache {
     if (dir.isEmpty) return 0;
     await _ensureIndex();
     return _bytes;
+  }
+
+  /// 缓存条目数（下载管理页展示用；`downloads/` 不参与统计）。
+  Future<int> entryCount() async {
+    if (dir.isEmpty) return 0;
+    await _ensureIndex();
+    return _sizes.length;
   }
 }
 
@@ -232,7 +315,6 @@ class StreamCacheWriter {
     required this.tmp,
     required this.sink,
     required this.contentType,
-    required this.length,
   });
 
   final StreamDiskCache cache;
@@ -240,14 +322,15 @@ class StreamCacheWriter {
   final File entry;
   final File tmp;
   final String contentType;
-  final int length;
   final IOSink sink;
   bool _done = false;
+  int _written = 0;
 
   void add(List<int> chunk) {
     if (_done) return;
     try {
       sink.add(chunk);
+      _written += chunk.length;
     } catch (_) {
       _done = true;
     }
@@ -268,7 +351,8 @@ class StreamCacheWriter {
         await File('${entry.path}.json')
             .writeAsString(jsonEncode({'type': contentType}));
       } catch (_) {}
-      cache._put(entry.path, length);
+      // 记账用实际写入量：上游截断时按声明长度会少算占用。
+      cache._put(entry.path, _written, contentType);
     } catch (_) {
       await abort();
     }

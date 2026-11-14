@@ -14,6 +14,7 @@ class PosterCard extends StatefulWidget {
     required this.onTap,
     this.onLongPress,
     this.onSecondaryLongPress,
+    this.onShowSources,
     this.showSource = false,
     this.heroTag,
     this.badge = '',
@@ -25,6 +26,9 @@ class PosterCard extends StatefulWidget {
 
   /// 鼠标右键按住一段时间（默认 600ms）触发；用于全源聚合搜索。
   final VoidCallback? onSecondaryLongPress;
+
+  /// 点「另有 N 个源」时展开同名跨源候选；null = 只显示文字。
+  final VoidCallback? onShowSources;
   final bool showSource;
   final String? heroTag;
 
@@ -228,11 +232,9 @@ class _PosterCardState extends State<PosterCard> {
                 ),
               ),
               if (item.sameFromOtherSources > 0)
-                Text(
-                  '另有 ${item.sameFromOtherSources} 个源',
-                  style: theme.textTheme.labelSmall?.copyWith(
-                    color: theme.colorScheme.primary,
-                  ),
+                _SourceCountLabel(
+                  count: item.sameFromOtherSources,
+                  onTap: widget.onShowSources,
                 ),
             ],
           ),
@@ -321,6 +323,42 @@ class _Placeholder extends StatelessWidget {
           ),
         ),
       ),
+    );
+  }
+}
+
+class _SourceCountLabel extends StatelessWidget {
+  const _SourceCountLabel({required this.count, this.onTap});
+
+  final int count;
+  final VoidCallback? onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final row = Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Icon(
+          Icons.layers_rounded,
+          size: 12,
+          color: theme.colorScheme.primary,
+        ),
+        const SizedBox(width: 4),
+        Text(
+          '另有 $count 个源',
+          style: theme.textTheme.labelSmall?.copyWith(
+            color: theme.colorScheme.primary,
+          ),
+        ),
+      ],
+    );
+    // 没有回调时不能包 GestureDetector：opaque 命中区域会吞掉整张卡片的点击。
+    if (onTap == null) return row;
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: onTap,
+      child: MouseRegion(cursor: SystemMouseCursors.click, child: row),
     );
   }
 }

@@ -142,7 +142,8 @@ class AppLog {
         '${now.second.toString().padLeft(2, '0')}.'
         '${now.millisecond.toString().padLeft(3, '0')}';
     final err = error == null ? '' : ' | error=${errorBrief(error)}';
-    final body = message.replaceAll('\n', ' / ');
+    // 消息体里也可能拼进完整 URL：统一遮掉 query 值，避免 token 落盘。
+    final body = redactQueryValues(message.replaceAll('\n', ' / '));
     return '$ts [$level][$tag] $body$err';
   }
 

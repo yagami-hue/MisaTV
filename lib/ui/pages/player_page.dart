@@ -20,22 +20,29 @@ import '../../models/player_fit.dart';
 import '../../models/site_config.dart';
 import '../../models/user_data.dart';
 import '../../models/vod.dart';
+import '../../models/video_download.dart';
 import '../widgets/danmaku_overlay.dart';
 import '../widgets/hover_marquee_text.dart';
 import '../widgets/hyms_captcha_dialog.dart';
 import '../widgets/mouse_drag_scroll.dart';
 import '../widgets/player_overlay_settings.dart';
+import '../widgets/sleep_timer_sheet.dart';
 import '../widgets/volume_hud.dart';
 import '../widgets/volume_sheet.dart';
 import '../../services/drive/drive_line_hint.dart';
 import '../../services/dlna/dlna.dart';
+import '../../services/download/video_download_service.dart';
+import '../../services/torrent/magnet.dart';
 import '../../services/boss_key/boss_key_service.dart';
 import '../../services/artwork/artwork_service.dart';
 import '../../services/player/auto_line_switch.dart';
 import '../../services/player/network_speed_smoother.dart';
 import '../../services/player/external_players.dart';
 import '../../services/player/skip_segments.dart';
+import '../../services/player/sleep_timer.dart';
 import '../../services/relay/local_relay.dart';
+import '../../services/party/party_room.dart';
+import '../../services/party/watch_party.dart';
 import '../../services/jar_spider/hyms_native.dart';
 import '../../services/mpv_extension.dart';
 import '../../services/play_page_unwrap.dart';
@@ -47,8 +54,28 @@ import '../../services/danmaku/danmaku_settings.dart';
 import '../../services/subtitle/subtitle_models.dart';
 import '../widgets/dlna_cast_sheet.dart';
 import '../widgets/subtitle_panel.dart';
+import '../widgets/video_download_dialog.dart';
 import '../../state/app_state.dart';
 import '../widgets/drive_login_prompt.dart';
+
+part 'player/cast_part.dart';
+part 'player/danmaku_part.dart';
+part 'player/download_part.dart';
+part 'player/party_part.dart';
+part 'player/playback_part.dart';
+
+/// 该播放地址是否是 DASH(MPD) 清单。
+///
+/// 内置内核是 libmdk + 随包 ffmpeg：前者不认 MPD，后者的 `dash` 只编进去了
+/// muxer（`dashenc`），没有 `dashdec` 解复用器 —— 所以 MPD 一定播不了。
+/// 用来把 fvp 的 "invalid or unsupported media" 翻译成用户能照做的提示。
+bool _looksLikeDashUrl(String url) {
+  final lower = url.toLowerCase();
+  if (lower.isEmpty) return false;
+  return lower.contains('.mpd') ||
+      lower.contains('type=mpd') ||
+      lower.contains('dash%2bxml');
+}
 
 class PlayerSession {
   const PlayerSession({
@@ -113,18 +140,41 @@ class _PlayerPageState extends State<PlayerPage>
   late SourceBean _site = widget.session.site;
   late String _flag = widget.session.flag;
   late List<Episode> _episodes = widget.session.episodes;
-  late final bool _ephemeral = widget.session.ephemeral;
+  late bool _ephemeral = widget.session.ephemeral;
   bool _opened = false;
   bool _controls = true;
   bool _cursorVisible = true;
   bool _sleepHeld = false;
   bool _buffering = true;
+
+  /// 缓冲超过一小段时间才亮转圈：轻微补帧不会闪一下遮住画面。
+  bool _bufferingHint = false;
+  Timer? _bufferingHintTimer;
   bool _playing = false;
   bool _fullscreen = false;
   bool _fsToggling = false;
   bool _resolving = false;
   bool _completedHandled = false;
   bool _mpvReady = false;
+
+  /// 睡眠定时器：到点暂停当前播放。
+  ///
+  /// 放在播放器页而不是全局 AppState：定时器的生命周期应该跟着这一集走，
+  /// 关掉播放器就自然失效，避免退出后还在后台倒计时。
+  late final SleepTimer _sleepTimer = SleepTimer(
+    onExpire: _onSleepTimerExpired,
+    onChanged: (_) {
+      if (mounted) setState(() {});
+    },
+  );
+
+  /// 定时器到点：暂停播放并提示。
+  void _onSleepTimerExpired() {
+    if (!mounted) return;
+    _controller?.pause();
+    setState(() => _playing = false);
+    _toast('睡眠定时器已到点，播放已暂停');
+  }
   String _error = '';
   Duration _position = Duration.zero;
   Duration _duration = Duration.zero;
@@ -233,6 +283,11 @@ class _PlayerPageState extends State<PlayerPage>
   int _openSeq = 0;
   Timer? _hideTimer;
   Timer? _saveTimer;
+
+  /// 一起看：是否已绑定房间状态监听，以及上次广播时间（节流）。
+  bool _partyBound = false;
+  int _lastPartyPushAt = 0;
+  bool _partyMismatchNotified = false;
 
   /// 播放器「详情」悬浮层开关与每秒刷新时钟 / 网速的计时器。
   bool _detailsVisible = false;
@@ -348,6 +403,13 @@ class _PlayerPageState extends State<PlayerPage>
     }
     _opened = true;
     _app = AppScope.of(context);
+    // 设置里的全局无痕模式：本次播放默认就不写历史 / 进度。
+    // 播放器里的「无痕播放」开关仍可对本次播放单独关掉，不改全局设置。
+    _ephemeral = _ephemeral || _app.playerSettings.incognito;
+    if (!_partyBound) {
+      _partyBound = true;
+      _app.watchParty.addListener(_onPartyUpdate);
+    }
     _lastAppliedBufferMin = _app.playerSettings.bufferMinSec;
     _lastAppliedBufferMax = _app.playerSettings.bufferMaxSec;
     _immersiveMode = _app.playerSettings.immersiveMode;
@@ -392,6 +454,7 @@ class _PlayerPageState extends State<PlayerPage>
         _buffering = false;
       }
     });
+    _syncBufferingHint(_buffering);
     if (value.hasError && !_errorLogged) {
       _errorLogged = true;
       AppLog.w(
@@ -409,6 +472,23 @@ class _PlayerPageState extends State<PlayerPage>
       );
     }
     _syncSleepInhibitor();
+    // 一起看：房主把进度广播到局域网（内部按 800ms 节流）。
+    final party = _app.watchParty;
+    if (party.hosting && !_live) {
+      final now = DateTime.now().millisecondsSinceEpoch;
+      if (now - _lastPartyPushAt >= 1500) {
+        _lastPartyPushAt = now;
+        party.publish(
+          PartyState(
+            title: _detail.name,
+            episodeName: _episodeName,
+            episodeIndex: _index,
+            positionMs: value.position.inMilliseconds,
+            playing: value.isPlaying,
+          ),
+        );
+      }
+    }
     if (!_live && value.isCompleted && !_completedHandled) {
       _completedHandled = true;
       _onCompleted();
@@ -684,6 +764,7 @@ class _PlayerPageState extends State<PlayerPage>
           episodeIndex: _index,
           url: target.url,
           rawUrl: _episodes[_index].url,
+          headers: target.headers,
           positionMs: appliedStart,
         );
       }
@@ -760,9 +841,49 @@ class _PlayerPageState extends State<PlayerPage>
         );
         return false;
       }
+      // 远程直链被防盗链拒绝（403 / 过期签名）时，fvp 同样只报
+      // `invalid or unsupported media`。历史续播复用的是上一次解析出的地址，
+      // 旧记录没存请求头、新记录的头也可能过期 —— 重新取一次链即可恢复。
+      final mediaOpenFailed =
+          e is PlatformException && '$e'.contains('invalid or unsupported media');
+      final canResolveAgain =
+          index >= 0 &&
+          index < _episodes.length &&
+          _episodes[index].url.trim().isNotEmpty &&
+          _episodes[index].url != target.url &&
+          !_looksLikeDashUrl(target.url);
+      if (!autoAttempt &&
+          mediaOpenFailed &&
+          canResolveAgain &&
+          _mediaRetriedEpisode != index) {
+        _mediaRetriedEpisode = index;
+        AppLog.w(
+          'player',
+          '播放地址打不开，自动重新取链一次 index=$index url=${redactUrl(target.url)}',
+        );
+        setState(() {
+          _resolving = true;
+          _buffering = true;
+          _error = '';
+        });
+        _toast('播放地址可能已过期，正在重新获取');
+        unawaited(
+          Future<void>.delayed(const Duration(milliseconds: 500), () {
+            if (mounted) _openEpisode(index: index, startMs: startMs);
+          }),
+        );
+        return false;
+      }
       _mediaRetriedEpisode = -1;
+      // DASH(MPD) 线路：内置内核（libmdk + 随包 ffmpeg 只有 muxer、没有 dashdec）
+      // 解不了这种清单，fvp 只会回 "invalid or unsupported media"。这不是
+      // 网络或防盗链问题，换线路才有用 —— 给出可操作的说明，而不是英文原文。
+      // 实测：wex 的 BiliGuard（高中课堂 / 少儿教育）只下发 dash+xml。
+      final dashLine = _looksLikeDashUrl(target.url);
       final message = timedOut
           ? '播放器加载超时：该线路可能是 4K / HDR 或编码不受支持，请换线路或改用外部播放器'
+          : dashLine
+          ? '该线路是 DASH(MPD) 格式，内置播放内核不支持；请切换到其它线路'
           : '播放器打开失败：$e';
       setState(() {
         _resolving = false;
@@ -1075,8 +1196,40 @@ class _PlayerPageState extends State<PlayerPage>
     return null;
   }
 
+  /// 打开睡眠定时器弹层并应用选择。
+  Future<void> _openSleepTimer() async {
+    final choice = await showSleepTimerSheet(
+      context: context,
+      current: _sleepTimer.state,
+      nowMs: DateTime.now().millisecondsSinceEpoch,
+    );
+    if (choice == null || !mounted) return;
+    if (choice.cancel) {
+      _sleepTimer.cancel();
+      _toast('已关闭睡眠定时');
+      return;
+    }
+    if (choice.atEndOfVideo) {
+      _sleepTimer.startAtEndOfVideo();
+      _toast('这一集播完后暂停，不会自动连播');
+      return;
+    }
+    final duration = choice.duration;
+    if (duration != null) {
+      _sleepTimer.startForDuration(duration);
+      _toast('${SleepTimer.formatDuration(duration.inMilliseconds)} 后自动暂停');
+    }
+  }
+
   void _onCompleted() {
     if (_live) return;
+    // 睡眠定时器优先于自动连播：「播完当前视频后暂停」就是让这一集播完后停下，
+    // 不能被下面的自动连播逻辑抢先切到下一集。
+    if (_sleepTimer.handleVideoEnded()) {
+      _controller?.pause();
+      _toast('已播完，睡眠定时器已暂停播放');
+      return;
+    }
     if (_outroFired) return; // 片尾跳过已经接管了切集
     final app = _app;
     if (!app.playerSettings.autoPlayNext) return;
@@ -1158,9 +1311,40 @@ class _PlayerPageState extends State<PlayerPage>
     });
   }
 
+  /// 鼠标移动**不再**唤出控制栏（控制栏改为单击唤出）。
+  ///
+  /// 只负责光标：控制栏收起时光标也跟着隐藏，此时移动鼠标必须能看见指针，
+  /// 否则用户既看不到控制栏、也看不到自己在点哪里。静止 3 秒后再收起。
+  void _onPointerMove() {
+    if (!mounted || _controls) return;
+    if (!_cursorVisible) setState(() => _cursorVisible = true);
+    _hideTimer?.cancel();
+    _hideTimer = Timer(const Duration(seconds: 3), () {
+      if (mounted && !_controls) setState(() => _cursorVisible = false);
+    });
+  }
+
+  /// 缓冲提示：短暂缓冲（不到 350ms）不亮转圈。
+  ///
+  /// 最大缓冲偏小时，每个分片交界处都可能出现一次很短的 buffering；
+  /// 立刻盖一层转圈会让本来只是轻微补帧的播放看起来「一卡一卡」。
+  void _syncBufferingHint(bool buffering) {
+    if (buffering) {
+      if (_bufferingHint || _bufferingHintTimer != null) return;
+      _bufferingHintTimer = Timer(const Duration(milliseconds: 350), () {
+        _bufferingHintTimer = null;
+        if (!mounted || !_buffering) return;
+        setState(() => _bufferingHint = true);
+      });
+    } else {
+      _bufferingHintTimer?.cancel();
+      _bufferingHintTimer = null;
+      if (_bufferingHint) setState(() => _bufferingHint = false);
+    }
+  }
+
   /// 播放中阻止系统自动休眠 / 关屏；暂停、出错时立即恢复系统策略。
   void _syncSleepInhibitor() {
-    // 缓冲期间也算「正在播放」，避免长时间缓冲时笔记本息屏。
     final active = _error.isEmpty && (_playing || _buffering);
     if (active && !_sleepHeld) {
       _sleepHeld = true;
@@ -1171,9 +1355,21 @@ class _PlayerPageState extends State<PlayerPage>
     }
   }
 
+  /// 单击画面：控制栏在「显示」与「收缩」之间切换。
+  ///
+  /// 与双击全屏不冲突：两者挂在同一个 GestureDetector 上，Flutter 的手势
+  /// 仲裁会等双击判定窗口过去再决定是否派发 onTap —— 快速双击只会进入全屏，
+  /// 不会顺带把控制栏切一下。
   void _toggleControls() {
+    if (!mounted) return;
     if (_controls) {
-      setState(() => _controls = false);
+      // 收缩：光标一起收，并取消待执行的自动收设计时器，
+      // 否则下次唤出后旧的计时器可能立刻把控制栏又收掉。
+      _hideTimer?.cancel();
+      setState(() {
+        _controls = false;
+        _cursorVisible = false;
+      });
     } else {
       _showControls();
     }
@@ -1397,7 +1593,16 @@ class _PlayerPageState extends State<PlayerPage>
 
   @override
   void dispose() {
+    // 离开播放器即作废睡眠定时器：它的作用域就是这一集，不该在后台继续倒计时。
+    _sleepTimer.dispose();
+    _bufferingHintTimer?.cancel();
     BossKeyService.instance.unbindPlayer(this);
+    // 一起看：房主关掉播放器就散场；观众停止轮询。
+    if (_partyBound) {
+      _app.watchParty.removeListener(_onPartyUpdate);
+      if (_app.watchParty.active) _app.watchParty.leave();
+      _partyBound = false;
+    }
     if (_opened) _saveProgress();
     // 网盘取流地址指向常驻 JVM 自己的内存服务，离开播放器就回收该进程。
     // 但地址已交给外部播放器时不能回收：Yaozhi MPV / PotPlayer 还在读 /chunk。
@@ -1510,6 +1715,9 @@ class _PlayerPageState extends State<PlayerPage>
     AppScope.of(context).requestSearch(name);
     Navigator.of(context).popUntil((route) => route.isFirst);
   }
+
+  /// part 里的 extension 不能直接调用 @protected 的 setState，统一走这里。
+  void _setState(VoidCallback fn) => setState(fn);
 
   void _toast(String message) {
     if (!mounted) return;
@@ -2009,10 +2217,16 @@ class _PlayerPageState extends State<PlayerPage>
               cursor: _cursorVisible
                   ? MouseCursor.defer
                   : SystemMouseCursors.none,
-              onHover: (_) => _showControls(),
+              // 鼠标移动只维持光标可见，不唤出控制栏（单击才唤出）。
+              onHover: (_) => _onPointerMove(),
               child: GestureDetector(
+                // 单击切换控制栏；双击全屏。二者由 Flutter 手势仲裁区分：
+                // 双击判定窗口内的第二次点击会取消 onTap，因此快速双击不会
+                // 顺带把控制栏切一下。
+                // opaque：加载中/无控制栏时子级（进度圈、弹幕层）不吸收点击，
+                // 默认的 deferToChild 会导致单击落空、无法唤出控制栏返回。
+                behavior: HitTestBehavior.opaque,
                 onTap: _toggleControls,
-                // 双击进入全屏；已全屏时再次双击退出。
                 onDoubleTap: () => unawaited(_toggleFullscreen()),
                 onLongPressStart: (_) => _startHoldRate(),
                 onLongPressEnd: (_) => _endHoldRate(),
@@ -2038,7 +2252,7 @@ class _PlayerPageState extends State<PlayerPage>
                       density: _app.danmakuSettings.density,
                       regionRatio: _app.danmakuSettings.regionRatio,
                     ),
-                    if (_buffering || _resolving)
+                    if (_bufferingHint || _resolving)
                       const Center(
                         child: CircularProgressIndicator(color: Colors.white),
                       ),
@@ -2241,6 +2455,19 @@ class _PlayerPageState extends State<PlayerPage>
                   onPressed: _castToDevice,
                   icon: const Icon(Icons.cast_rounded, color: Colors.white),
                 ),
+              if (!mini && _isDesktop)
+                IconButton(
+                  tooltip: _app.watchParty.active ? '一起看（进行中）' : '一起看（局域网同看）',
+                  onPressed: _showWatchParty,
+                  icon: Icon(
+                    _app.watchParty.active
+                        ? Icons.groups_rounded
+                        : Icons.groups_outlined,
+                    color: _app.watchParty.active
+                        ? const Color(0xFF7DD3FC)
+                        : Colors.white,
+                  ),
+                ),
               if (_isDesktop)
                 IconButton(
                   tooltip: _mini ? '回归正常窗口' : '小窗播放（始终置顶）',
@@ -2254,6 +2481,21 @@ class _PlayerPageState extends State<PlayerPage>
                           Icons.picture_in_picture_alt_outlined,
                           color: Colors.white,
                         ),
+                ),
+              if (!mini)
+                IconButton(
+                  tooltip: _sleepTimer.active
+                      ? '睡眠定时：${sleepTimerBadge(_sleepTimer.state, DateTime.now().millisecondsSinceEpoch)}'
+                      : '睡眠定时',
+                  onPressed: _openSleepTimer,
+                  icon: Icon(
+                    _sleepTimer.active
+                        ? Icons.bedtime_rounded
+                        : Icons.bedtime_outlined,
+                    color: _sleepTimer.active
+                        ? Theme.of(context).colorScheme.primary
+                        : Colors.white,
+                  ),
                 ),
               if (!mini)
                 IconButton(
@@ -2876,1141 +3118,6 @@ class _PlayerPageState extends State<PlayerPage>
     );
   }
 
-  Future<void> _toggleDanmaku() async {
-    if (_danmakuEnabled) {
-      _danmakuSeq++;
-      setState(() => _danmakuEnabled = false);
-      await _app.setDanmakuSettings(
-        _app.danmakuSettings.copyWith(enabled: false),
-      );
-      return;
-    }
-    setState(() => _danmakuEnabled = true);
-    final settings = _app.danmakuSettings.copyWith(enabled: true);
-    await _app.setDanmakuSettings(settings);
-    if (_allDanmaku.isEmpty) await _loadDanmaku();
-  }
-
-  /// 按弹幕屏蔽词过滤（关键词包含或 `/正则/`）。
-  List<DanmakuLine> _filterDanmaku(List<DanmakuLine> items) {
-    final words = _app.danmakuSettings.blockWords;
-    if (words.isEmpty) return items;
-    return [
-      for (final item in items)
-        if (!isDanmakuBlocked(item.text, words)) item,
-    ];
-  }
-
-  String _danmakuSummary() {
-    final settings = _app.danmakuSettings;
-    if (!settings.enabled) return '弹幕已关闭';
-    return [
-      '${(settings.regionRatio * 100).round()}% 屏',
-      '${settings.speed.round()}px/s',
-      if (settings.density < 0.995) '密度 ${(settings.density * 100).round()}%',
-      '字号 ${settings.fontSize.toStringAsFixed(0)}',
-      if (settings.blockWords.isNotEmpty) '屏蔽 ${settings.blockWords.length} 词',
-    ].join(' · ');
-  }
-
-  /// 播放器内的弹幕独立调节面板：速度、密度、屏占、字号、透明度、偏移、屏蔽词。
-  Future<void> _showDanmakuPanel() async {
-    var settings = _app.danmakuSettings;
-    final wordsCtrl = TextEditingController(
-      text: settings.blockWords.join('\n'),
-    );
-    final result = await showModalBottomSheet<DanmakuSettings>(
-      context: context,
-      isScrollControlled: true,
-      builder: (ctx) {
-        return StatefulBuilder(
-          builder: (ctx, setSheet) {
-            final theme = Theme.of(ctx);
-            Widget slider(
-              String label,
-              String display,
-              double value,
-              double min,
-              double max,
-              int divisions,
-              ValueChanged<double> onChanged,
-            ) {
-              return Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Row(
-                    children: [
-                      Text(label, style: theme.textTheme.bodySmall),
-                      const Spacer(),
-                      Text(display, style: theme.textTheme.labelSmall),
-                    ],
-                  ),
-                  Slider(
-                    value: value.clamp(min, max).toDouble(),
-                    min: min,
-                    max: max,
-                    divisions: divisions,
-                    onChanged: (v) => setSheet(() => onChanged(v)),
-                  ),
-                ],
-              );
-            }
-
-            return SafeArea(
-              child: Padding(
-                padding: EdgeInsets.only(
-                  bottom: MediaQuery.viewInsetsOf(ctx).bottom,
-                ),
-                child: SingleChildScrollView(
-                  padding: const EdgeInsets.fromLTRB(20, 4, 20, 18),
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Row(
-                        children: [
-                          Text('弹幕设置', style: theme.textTheme.titleLarge),
-                          const Spacer(),
-                          TextButton(
-                            onPressed: () => Navigator.of(ctx).pop(),
-                            child: const Text('取消'),
-                          ),
-                          const SizedBox(width: 4),
-                          FilledButton(
-                            onPressed: () => Navigator.of(ctx).pop(
-                              settings.copyWith(
-                                blockWords: normalizeDanmakuBlockWords(
-                                  wordsCtrl.text,
-                                ),
-                              ),
-                            ),
-                            child: const Text('保存'),
-                          ),
-                        ],
-                      ),
-                      SwitchListTile.adaptive(
-                        contentPadding: EdgeInsets.zero,
-                        value: settings.enabled,
-                        onChanged: (v) => setSheet(
-                          () => settings = settings.copyWith(enabled: v),
-                        ),
-                        title: const Text('显示弹幕'),
-                        subtitle: Text(
-                          '当前可用 ${_danmaku.length} 条'
-                          '${settings.blockWords.isEmpty ? '' : ' · 已屏蔽 ${_allDanmaku.length - _danmaku.length} 条'}',
-                        ),
-                      ),
-                      slider(
-                        '显示区域',
-                        '${(settings.regionRatio * 100).round()}% 屏',
-                        settings.regionRatio,
-                        danmakuRegionMinRatio,
-                        danmakuRegionMaxRatio,
-                        18,
-                        (v) => settings = settings.copyWith(regionRatio: v),
-                      ),
-                      const SizedBox(height: 8),
-                      slider(
-                        '滚动速度',
-                        '${settings.speed.round()}px/s',
-                        settings.speed,
-                        40,
-                        300,
-                        26,
-                        (v) => settings = settings.copyWith(speed: v),
-                      ),
-                      slider(
-                        '弹幕密度',
-                        '${(settings.density * 100).round()}%',
-                        settings.density,
-                        0.1,
-                        1,
-                        9,
-                        (v) => settings = settings.copyWith(density: v),
-                      ),
-                      slider(
-                        '字号',
-                        '${settings.fontSize.toStringAsFixed(0)}px',
-                        settings.fontSize,
-                        12,
-                        40,
-                        28,
-                        (v) => settings = settings.copyWith(fontSize: v),
-                      ),
-                      slider(
-                        '透明度',
-                        '${(settings.opacity * 100).round()}%',
-                        settings.opacity,
-                        0.2,
-                        1,
-                        8,
-                        (v) => settings = settings.copyWith(opacity: v),
-                      ),
-                      slider(
-                        '时间偏移',
-                        '${settings.offset.toStringAsFixed(1)}s',
-                        settings.offset,
-                        -10,
-                        10,
-                        40,
-                        (v) => settings = settings.copyWith(offset: v),
-                      ),
-                      const SizedBox(height: 6),
-                      TextField(
-                        controller: wordsCtrl,
-                        minLines: 2,
-                        maxLines: 4,
-                        decoration: const InputDecoration(
-                          labelText: '弹幕屏蔽词',
-                          hintText: '每行一个关键词；/正则/ 写法也可',
-                          alignLabelWithHint: true,
-                        ),
-                      ),
-                      const SizedBox(height: 6),
-                      Text(
-                        '关键词不区分大小写；屏蔽只影响当前弹幕层，不会改动拉取到的原始数据。',
-                        style: theme.textTheme.labelSmall?.copyWith(
-                          color: theme.colorScheme.onSurface.withValues(
-                            alpha: 0.55,
-                          ),
-                          height: 1.5,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-            );
-          },
-        );
-      },
-    );
-    wordsCtrl.dispose();
-    if (result == null) return;
-    await _app.setDanmakuSettings(result);
-    if (!mounted) return;
-    setState(() {
-      _danmakuEnabled = result.enabled;
-      _danmaku = _filterDanmaku(_allDanmaku);
-    });
-    if (result.enabled && _allDanmaku.isEmpty) await _loadDanmaku();
-  }
-
-  Future<void> _loadDanmaku() async {
-    final seq = ++_danmakuSeq;
-    final detail = _detail;
-    final keyword = detail.name.trim();
-    if (keyword.isEmpty) return;
-    final episodeName = _episodeName.trim();
-    final parsedEp = parseEpisodeInput(episodeName);
-    final targetEp = parsedEp.ep?.trim().isNotEmpty == true
-        ? parsedEp.ep!.trim()
-        : '${_index + 1}';
-    final season =
-        parsedEp.season ?? seasonOf(detail.name) ?? seasonOf(episodeName);
-    final settings = _app.danmakuSettings;
-    final enabled = settings.endpoints
-        .where((e) => e.enabled && e.url.trim().isNotEmpty)
-        .toList();
-    final broad = <DanmakuEndpoint>[...enabled];
-    const broadLimit = 12;
-    if (broad.length < broadLimit) {
-      for (final e in settings.endpoints) {
-        if (broad.length >= broadLimit) break;
-        if (!e.enabled && e.url.trim().isNotEmpty) {
-          broad.add(e.copyWith(enabled: true));
-        }
-      }
-    }
-
-    try {
-      var broadTried = false;
-      var candidates = await _app.danmakuService.search(
-        keyword,
-        season: season,
-      );
-      if (!mounted || seq != _danmakuSeq) return;
-      if (candidates.isEmpty && broad.length > enabled.length) {
-        broadTried = true;
-        _toast('主弹幕源未命中，正在扩大搜索…');
-        candidates = await _app.danmakuService.search(
-          keyword,
-          endpoints: broad,
-          season: season,
-        );
-        if (!mounted || seq != _danmakuSeq) return;
-      }
-      if (candidates.isEmpty) {
-        _toast('没有找到「$keyword」的弹幕；可在设置 → 弹幕接口启用更多源');
-        return;
-      }
-
-      Future<({DanmakuCandidate candidate, List<DanmakuItem> items})?>
-      fetchFirst() async {
-        final ranked = DanmakuService.rankCandidates(
-          candidates,
-          keyword,
-          season: season,
-          ep: targetEp,
-        );
-        final exact = ranked
-            .where((c) => candidateMatchesEp(c, targetEp))
-            .toList();
-        final noEp = ranked.where((c) => epNumberOf(c) == null).toList();
-        final rest = ranked
-            .where(
-              (c) => !candidateMatchesEp(c, targetEp) && epNumberOf(c) != null,
-            )
-            .toList();
-        final picks = <DanmakuCandidate>{
-          ...exact,
-          ...noEp,
-          ...rest,
-        }.take(3).toList();
-        Future<({DanmakuCandidate candidate, List<DanmakuItem> items})>
-        fetchOne(DanmakuCandidate candidate) async {
-          try {
-            final items = await _app.danmakuService.fetch(
-              candidate,
-              timeout: const Duration(seconds: 20),
-            );
-            return (candidate: candidate, items: items);
-          } catch (_) {
-            return (candidate: candidate, items: const <DanmakuItem>[]);
-          }
-        }
-
-        if (picks.isEmpty) return null;
-        // 最佳候选先单独拉：命中就立刻上屏；空了再并发试其余候选。
-        final first = await fetchOne(picks.first);
-        if (first.items.isNotEmpty) return first;
-        if (picks.length > 1) {
-          final restResults = await Future.wait(picks.skip(1).map(fetchOne));
-          for (final result in restResults) {
-            if (result.items.isNotEmpty) return result;
-          }
-        }
-        return null;
-      }
-
-      var hit = await fetchFirst();
-      if ((hit == null) && !broadTried && broad.length > enabled.length) {
-        broadTried = true;
-        _toast('已找到条目但没有可用弹幕，正在换源重试…');
-        candidates = await _app.danmakuService.search(
-          keyword,
-          endpoints: broad,
-          season: season,
-        );
-        if (!mounted || seq != _danmakuSeq) return;
-        if (candidates.isNotEmpty) hit = await fetchFirst();
-      }
-      if (!mounted || seq != _danmakuSeq) return;
-      if (hit == null) {
-        _toast('已找到条目，但第 $targetEp 集没有可用弹幕；可在设置 → 弹幕接口启用更多源');
-        return;
-      }
-
-      final items = hit.items;
-      final all = [
-        for (final item in items)
-          DanmakuLine(
-            time: item.time,
-            type: item.type,
-            text: item.text,
-            size: item.size,
-            color: item.color,
-          ),
-      ];
-      setState(() {
-        _allDanmaku = all;
-        _danmaku = _filterDanmaku(all);
-        _danmakuEnabled = true;
-      });
-      _toast('弹幕已加载 ${items.length} 条（${hit.candidate.sourceName}）');
-    } catch (e) {
-      if (mounted) _toast('弹幕加载失败：$e');
-    }
-  }
-
-  Future<void> _showSubtitlePanel() async {
-    final detail = _detail;
-    final file = await showSubtitlePanel(
-      context,
-      service: _app.subtitleService,
-      query: SubtitleQuery(
-        title: detail.name,
-        year: int.tryParse(detail.year),
-        episode: _index + 1,
-        rawName: _episodeName,
-      ),
-      currentName: _subtitleStatus,
-      onClear: _clearSubtitle,
-    );
-    if (file == null) return;
-    await _applySubtitle(file);
-  }
-
-  Future<void> _applySubtitle(SubtitleFile file) async {
-    final controller = _controller;
-    if (controller == null) {
-      _toast('播放器还没准备好，稍后再试');
-      return;
-    }
-    try {
-      final support = await getApplicationSupportDirectory();
-      final dir = Directory(p.join(support.path, 'subtitles'))
-        ..createSync(recursive: true);
-      final ext = switch (file.format.toLowerCase()) {
-        'ass' || 'ssa' => 'ass',
-        'vtt' => 'vtt',
-        _ => 'srt',
-      };
-      final target = File(
-        p.join(
-          dir.path,
-          'current-${DateTime.now().millisecondsSinceEpoch}.$ext',
-        ),
-      );
-      await target.writeAsString(file.text);
-      controller.setExternalSubtitle(target.path);
-      final active = controller.getActiveSubtitleTracks();
-      if (active == null || active.isEmpty) {
-        controller.setSubtitleTracks(const [0]);
-        final retry = controller.getActiveSubtitleTracks();
-        if (retry == null || retry.isEmpty) {
-          controller.setSubtitleTracks(const [1]);
-        }
-      }
-      if (!mounted) return;
-      setState(() => _subtitleStatus = file.name.isEmpty ? '外挂字幕' : file.name);
-      _toast('字幕已载入：$_subtitleStatus');
-    } catch (e) {
-      _toast('字幕挂载失败（当前内核可能不支持外挂字幕）：$e');
-    }
-  }
-
-  void _clearSubtitle() {
-    try {
-      _controller?.setExternalSubtitle('');
-      _controller?.setSubtitleTracks(const []);
-    } catch (_) {
-      // 非 fvp 内核忽略
-    }
-    if (mounted) setState(() => _subtitleStatus = '');
-  }
-
-  Future<void> _showPlaybackSettings() async {
-    await showModalBottomSheet<void>(
-      context: context,
-      isScrollControlled: true,
-      builder: (ctx) {
-        final theme = Theme.of(ctx);
-        Widget item({
-          required IconData icon,
-          required String title,
-          required String subtitle,
-          required VoidCallback onTap,
-          bool enabled = true,
-        }) => ListTile(
-          enabled: enabled,
-          contentPadding: EdgeInsets.zero,
-          leading: Icon(icon),
-          title: Text(title),
-          subtitle: Text(
-            subtitle,
-            maxLines: 2,
-            overflow: TextOverflow.ellipsis,
-          ),
-          trailing: enabled ? const Icon(Icons.chevron_right_rounded) : null,
-          onTap: enabled
-              ? () {
-                  Navigator.of(ctx).pop();
-                  onTap();
-                }
-              : null,
-        );
-        return SafeArea(
-          child: ConstrainedBox(
-            // 小窗只有 480×292：整张面板必须可滚动，否则底部入口会被窗口
-            // 底边裁掉，根本点不到。
-            constraints: BoxConstraints(
-              maxHeight: MediaQuery.sizeOf(ctx).height * 0.92,
-            ),
-            child: SingleChildScrollView(
-              padding: const EdgeInsets.fromLTRB(20, 4, 20, 18),
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text('播放设置', style: theme.textTheme.titleLarge),
-                  const SizedBox(height: 8),
-                  item(
-                    icon: Icons.aspect_ratio_rounded,
-                    title: '画面比例',
-                    subtitle: _fit.label,
-                    onTap: _showFit,
-                  ),
-                  if (_mdkEnabled)
-                    item(
-                      icon: Icons.audiotrack_rounded,
-                      title: '音轨',
-                      subtitle: _audioOptions.length > 1
-                          ? _audioLabelOf(_activeAudio)
-                          : '当前视频只有一条音轨',
-                      enabled: _audioOptions.length > 1,
-                      onTap: _showAudioTracks,
-                    ),
-                  item(
-                    icon: Icons.chat_bubble_outline_rounded,
-                    title: '弹幕设置',
-                    subtitle: _danmakuSummary(),
-                    onTap: _showDanmakuPanel,
-                  ),
-                  item(
-                    icon: Icons.open_in_new_rounded,
-                    title: '外部播放器',
-                    subtitle: '自动检测 + 设置中添加的播放器',
-                    onTap: _showExternalPlayers,
-                  ),
-                  const SizedBox(height: 6),
-                  Text(
-                    '长按画面可临时 1.5x 快进，松开恢复原倍速；长按底栏「弹幕」可单独调整速度 / 屏占 / 屏蔽词；小窗按钮在顶栏。',
-                    style: theme.textTheme.bodySmall?.copyWith(
-                      color: theme.colorScheme.onSurface.withValues(
-                        alpha: 0.76,
-                      ),
-                      height: 1.5,
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ),
-        );
-      },
-    );
-  }
-
-  Future<void> _showFit() async {
-    await showModalBottomSheet<void>(
-      context: context,
-      builder: (ctx) => SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(20, 4, 20, 20),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text('画面比例', style: Theme.of(ctx).textTheme.titleLarge),
-              const SizedBox(height: 12),
-              Wrap(
-                spacing: 8,
-                runSpacing: 8,
-                children: [
-                  for (final fit in playerFits)
-                    ChoiceChip(
-                      label: Text(fit.label),
-                      selected: _fit == fit,
-                      onSelected: (_) {
-                        Navigator.of(ctx).pop();
-                        unawaited(_setFit(fit));
-                      },
-                    ),
-                ],
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
-  Future<void> _setFit(PlayerFit fit) async {
-    if (mounted) setState(() => _fit = fit);
-    await _app.setPlayerSettings(_app.playerSettings.copyWith(fit: fit.name));
-  }
-
-  Future<void> _showAudioTracks() async {
-    if (_audioOptions.length < 2) return;
-    await showModalBottomSheet<void>(
-      context: context,
-      isScrollControlled: true,
-      builder: (ctx) => SafeArea(
-        child: ConstrainedBox(
-          constraints: BoxConstraints(
-            maxHeight: MediaQuery.sizeOf(ctx).height * 0.9,
-          ),
-          child: SingleChildScrollView(
-            padding: const EdgeInsets.fromLTRB(20, 4, 20, 20),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text('音轨', style: Theme.of(ctx).textTheme.titleLarge),
-                const SizedBox(height: 6),
-                Text(
-                  '按封装内顺序列出，语言来自媒体元数据。',
-                  style: Theme.of(ctx).textTheme.bodySmall,
-                ),
-                const SizedBox(height: 10),
-                for (final option in _audioOptions)
-                  ListTile(
-                    contentPadding: EdgeInsets.zero,
-                    leading: Icon(
-                      _activeAudio == option.index
-                          ? Icons.check_circle_rounded
-                          : Icons.audiotrack_rounded,
-                      color: _activeAudio == option.index
-                          ? Theme.of(ctx).colorScheme.primary
-                          : null,
-                    ),
-                    title: Text(_audioLabel(option)),
-                    subtitle: Text(
-                      '${option.codec.toUpperCase()}'
-                      '${option.channels > 0 ? ' · ${option.channels} 声道' : ''}',
-                    ),
-                    onTap: () {
-                      Navigator.of(ctx).pop();
-                      _selectAudio(option);
-                    },
-                  ),
-              ],
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-
-  void _selectAudio(_AudioOption option) {
-    try {
-      _controller?.setAudioTracks([option.index]);
-      setState(() => _activeAudio = option.index);
-      _toast('已切换音轨：${_audioLabel(option)}');
-    } catch (e) {
-      _toast('切换音轨失败：$e');
-    }
-  }
-
-  /// 进度条右键入口：单击取点，双击清除。
-  ///
-  /// 双击只能靠延迟确认：第一次右键按下先挂起一次取点，过了双击窗口还没等到
-  /// 第二次按下才真正执行；窗口内再次按下（位置偏差在 slop 内）就取消挂起、
-  /// 改为清除本资源的记录。这样不会出现「双击的第一下已经写进记录」的脏状态。
-  void _onProgressSecondaryDown({required double width, required double dx}) {
-    final now = DateTime.now();
-    final last = _lastSecondaryTapAt;
-    final isDoubleTap =
-        last != null &&
-        isSkipDoubleTap(
-          gap: now.difference(last),
-          dx: dx,
-          lastDx: _lastSecondaryTapDx,
-        );
-    _skipTapTimer?.cancel();
-    _skipTapTimer = null;
-    if (isDoubleTap) {
-      _lastSecondaryTapAt = null;
-      unawaited(_clearSkipSegments());
-      return;
-    }
-    _lastSecondaryTapAt = now;
-    _lastSecondaryTapDx = dx;
-    _skipTapTimer = Timer(skipDoubleTapWindow, () {
-      _skipTapTimer = null;
-      _lastSecondaryTapAt = null;
-      unawaited(_pickSkipFromProgress(width: width, localDx: dx));
-    });
-  }
-
-  /// 取消还没执行的右键取点（开始拖进度条或离开页面时）。
-  void _cancelPendingSkipPick() {
-    _skipTapTimer?.cancel();
-    _skipTapTimer = null;
-    _lastSecondaryTapAt = null;
-  }
-
-  /// 右键双击进度条：清掉本资源的片头 / 片尾记录，与弹窗里的「清除本资源」一致。
-  Future<void> _clearSkipSegments() async {
-    if (_live) return;
-    if (_skipIntro <= 0 && _skipOutro <= 0) {
-      _toast('当前没有片头 / 片尾记录');
-      return;
-    }
-    await _saveSkipSegments(0, 0);
-    if (!mounted) return;
-    _toast('已清除本资源的片头 / 片尾记录');
-  }
-
-  /// 进度条右键：直接按点击位置选取片头 / 片尾，不再弹二次菜单。
-  ///
-  /// 用区间来区分两种设置，避免互相踩：开头 5 分钟内 = 片头，结尾 5 分钟内 =
-  /// 片尾；不足 10 分钟的短片按前后各一半切分；中间区域只提示、不写入。
-  /// 片头 = 起播直接跳到的绝对秒数；片尾 = 距结尾还剩多少秒开始跳下一集，
-  /// 与「跳过片头 / 片尾」弹窗里的语义一致，选完立即落盘并对本资源全部剧集生效。
-  Future<void> _pickSkipFromProgress({
-    required double width,
-    required double localDx,
-  }) async {
-    if (_live) return;
-    final total = _duration.inMilliseconds;
-    if (total <= 0) return;
-    // Slider 的可见轨道两端各内缩 overlay 半径（上面 SliderTheme 设为 12），
-    // 换算前先扣掉这段，点击位置才不会整体偏早。
-    const inset = 12.0;
-    final usable = width - inset * 2 > 1 ? width - inset * 2 : 1.0;
-    final ratio = ((localDx - inset) / usable).clamp(0.0, 1.0);
-    final picked = Duration(milliseconds: (ratio * total).round());
-    final remaining = picked >= _duration ? Duration.zero : _duration - picked;
-
-    const window = Duration(minutes: 5);
-    final bool asIntro;
-    if (_duration <= window * 2) {
-      // 短片没有 5 分钟窗口可言：按中点分前后，一次右键照样能选到。
-      asIntro = picked <= _duration ~/ 2;
-    } else if (picked <= window) {
-      asIntro = true;
-    } else if (remaining <= window) {
-      asIntro = false;
-    } else {
-      _toast('右键取片头 / 片尾：请在开头 5 分钟或结尾 5 分钟内点击');
-      return;
-    }
-
-    if (asIntro) {
-      final intro = clampSkipSeconds(picked.inSeconds);
-      if (intro <= 0) {
-        _toast('这个位置等于 0 秒，片头无需跳过');
-        return;
-      }
-      await _saveSkipSegments(intro, _skipOutro);
-      if (!mounted) return;
-      _toast('片头已设为 ${_fmt(picked)}（本资源所有剧集）');
-      if (_position.inSeconds < intro) _seekTo(Duration(seconds: intro));
-      return;
-    }
-    final outro = clampSkipSeconds(remaining.inSeconds);
-    // 片尾秒数 ≤1 时本就不会触发跳集（见 shouldSkipOutro），别写个死值进去。
-    if (outro <= 1) {
-      _toast('离结尾太近，请点在更靠前的位置');
-      return;
-    }
-    await _saveSkipSegments(_skipIntro, outro);
-    if (!mounted) return;
-    _toast('片尾已设为 剩 ${_fmt(remaining)}（本资源所有剧集）');
-  }
-
-  /// 落盘片头 / 片尾秒数：本资源所有剧集共用一份，并同步播放器内的跳过状态。
-  Future<void> _saveSkipSegments(int intro, int outro) async {
-    await _app.saveSkipSegment(
-      resource: '${_detail.sourceKey}|${_detail.id}',
-      episode: _episodeKey(_index),
-      intro: intro,
-      outro: outro,
-      label: _episodeName.isEmpty ? '第${_index + 1}集' : _episodeName,
-    );
-    if (!mounted) return;
-    setState(() {
-      _skipIntro = intro;
-      _skipOutro = outro;
-      _skipInheritedFrom = '';
-      _outroFired = false;
-    });
-  }
-
-  Future<void> _showSkipSettings() async {
-    final introCtrl = TextEditingController(
-      text: _skipIntro > 0 ? '$_skipIntro' : '',
-    );
-    final outroCtrl = TextEditingController(
-      text: _skipOutro > 0 ? '$_skipOutro' : '',
-    );
-    final action = await showDialog<String>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('跳过片头 / 片尾'),
-        // 小窗里对话框只有 480×292 的可用空间：去掉默认的大边距，并让
-        // 标题 + 内容整体可滚动，片头/片尾输入框和快捷按钮才都能操作。
-        insetPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-        scrollable: true,
-        content: ConstrainedBox(
-          constraints: const BoxConstraints(maxWidth: 440),
-          child: StatefulBuilder(
-            builder: (ctx, setDialog) {
-              Widget field(TextEditingController controller, String label) =>
-                  TextField(
-                    controller: controller,
-                    keyboardType: TextInputType.number,
-                    decoration: InputDecoration(
-                      labelText: label,
-                      hintText: '0 = 不跳过',
-                    ),
-                  );
-              return LayoutBuilder(
-                builder: (ctx, constraints) {
-                  // 小窗还能继续缩小到 280×160：窄到并排放不下时改上下排。
-                  final narrow = constraints.maxWidth < 360;
-                  return Column(
-                    mainAxisSize: MainAxisSize.min,
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      if (_skipInheritedFrom.isNotEmpty)
-                        Padding(
-                          padding: const EdgeInsets.only(bottom: 8),
-                          child: Text(
-                            '本资源所有剧集共用该设置（当前值来自「$_skipInheritedFrom」）。',
-                            style: Theme.of(ctx).textTheme.bodySmall,
-                          ),
-                        ),
-                      if (narrow) ...[
-                        field(introCtrl, '片头跳过秒数'),
-                        const SizedBox(height: 10),
-                        field(outroCtrl, '片尾跳过秒数'),
-                      ] else
-                        Row(
-                          children: [
-                            Expanded(child: field(introCtrl, '片头跳过秒数')),
-                            const SizedBox(width: 12),
-                            Expanded(child: field(outroCtrl, '片尾跳过秒数')),
-                          ],
-                        ),
-                      const SizedBox(height: 12),
-                      Wrap(
-                        spacing: 8,
-                        runSpacing: 8,
-                        children: [
-                          OutlinedButton(
-                            onPressed: () {
-                              introCtrl.text = '${_position.inSeconds}';
-                              setDialog(() {});
-                            },
-                            child: Text('片头设为当前（${_fmt(_position)}）'),
-                          ),
-                          OutlinedButton(
-                            onPressed: () {
-                              final remain = _duration - _position;
-                              final safe = remain.isNegative
-                                  ? Duration.zero
-                                  : remain;
-                              outroCtrl.text = '${safe.inSeconds}';
-                              setDialog(() {});
-                            },
-                            child: Text(
-                              '片尾设为当前（剩 ${_fmt(_duration > _position ? _duration - _position : Duration.zero)}）',
-                            ),
-                          ),
-                        ],
-                      ),
-                      const SizedBox(height: 10),
-                      Text(
-                        '保存后对本资源所有剧集生效；片头 = 起播直接跳到该秒数，'
-                        '片尾 = 距结尾还剩这么多秒时自动跳下一集。\n'
-                        '进度条上右键可直接取点：开头 5 分钟算片头，结尾 5 分钟算片尾；'
-                        '右键双击进度条可清除记录。',
-                        style: Theme.of(ctx).textTheme.bodySmall
-                            ?.copyWith(height: 1.5),
-                      ),
-                    ],
-                  );
-                },
-              );
-            },
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(ctx).pop('clear'),
-            child: const Text('清除本资源'),
-          ),
-          TextButton(
-            onPressed: () => Navigator.of(ctx).pop(),
-            child: const Text('取消'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.of(ctx).pop('save'),
-            child: const Text('保存'),
-          ),
-        ],
-      ),
-    );
-    final intro = action == 'clear' ? 0 : clampSkipSeconds(introCtrl.text);
-    final outro = action == 'clear' ? 0 : clampSkipSeconds(outroCtrl.text);
-    introCtrl.dispose();
-    outroCtrl.dispose();
-    if (action == null) return;
-    await _saveSkipSegments(intro, outro);
-    if (!mounted) return;
-    if (action == 'clear') {
-      _toast('已清除该资源所有剧集的跳过设置');
-      return;
-    }
-    _toast('已保存：片头 ${intro}s / 片尾 ${outro}s（本资源全部剧集）');
-    if (intro > 0 && _position.inSeconds < intro) {
-      _seekTo(Duration(seconds: intro));
-    }
-  }
-
-  String _skipSummary() {
-    if (_skipIntro <= 0 && _skipOutro <= 0) return '未设置';
-    final parts = <String>[
-      if (_skipIntro > 0) '片头 $_skipIntro 秒',
-      if (_skipOutro > 0) '片尾 $_skipOutro 秒',
-    ];
-    final base = parts.join(' / ');
-    return _skipInheritedFrom.isEmpty ? base : '$base（本资源共用）';
-  }
-
-  Future<void> _castToDevice() async {
-    final current = _currentPlay;
-    if (current == null || current.url.trim().isEmpty) {
-      _toast('还没有可投屏的播放地址');
-      return;
-    }
-    final app = _app;
-    final source = app.preparePlay(current);
-    final title = '${_detail.name} $_episodeName'.trim();
-    final target = parseCastTarget(
-      source.url,
-      title,
-      _position.inMilliseconds,
-      relayBase: LocalRelay.instance.baseUrl,
-      extraHeaders: source.headers,
-    );
-    if (target.url.trim().isEmpty) {
-      _toast('当前地址无法投屏');
-      return;
-    }
-    await showDlnaCastSheet(
-      context,
-      target: target,
-      davAuth: (id) => app.davService.authHeader(id),
-    );
-  }
-
-  /// 多集时生成 M3U 选集列表；单集或生成失败返回 null（回退单地址）。
-  Future<String?> _externalPlaylistPath({String? currentUrl}) async {
-    final service = _app.externalPlaylist;
-    if (service == null || _episodes.length < 2) return null;
-    final path = await service.createPlaylist(
-      site: _site,
-      flag: _flag,
-      episodes: _episodes,
-      currentIndex: _index,
-      currentUrl: currentUrl,
-    );
-    if (path == null) {
-      AppLog.w('player', '外部播放器选集列表生成失败，回退为单集地址');
-    }
-    return path;
-  }
-
-  Future<void> _showExternalPlayers() async {
-    final players = detectExternalPlayers(custom: _app.customExternalPlayers);
-    if (players.isEmpty) {
-      if (_mpvReady) {
-        await _openWithMpv();
-      } else {
-        _toast('未检测到外部播放器；可在 设置 → 播放 → 自定义第三方播放器 选择任意播放器 exe');
-      }
-      return;
-    }
-    await showModalBottomSheet<void>(
-      context: context,
-      isScrollControlled: true,
-      builder: (ctx) => SafeArea(
-        child: ConstrainedBox(
-          constraints: BoxConstraints(
-            maxHeight: MediaQuery.sizeOf(ctx).height * 0.9,
-          ),
-          child: SingleChildScrollView(
-            padding: const EdgeInsets.fromLTRB(20, 4, 20, 20),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text('外部播放器', style: Theme.of(ctx).textTheme.titleLarge),
-                const SizedBox(height: 6),
-                Text(
-                  '用本机播放器打开当前集；多集时会把整份选集列表带过去，可在播放器片单里切集。'
-                  '自定义播放器可在 设置 → 播放 中添加。',
-                  style: Theme.of(ctx).textTheme.bodySmall,
-                ),
-                const SizedBox(height: 8),
-                if (_mpvReady)
-                  ListTile(
-                    contentPadding: EdgeInsets.zero,
-                    leading: const Icon(Icons.play_circle_outline_rounded),
-                    title: const Text('Yaozhi MPV（内置扩展）'),
-                    onTap: () {
-                      Navigator.of(ctx).pop();
-                      unawaited(_openWithMpv());
-                    },
-                  ),
-                for (final player in players)
-                  ListTile(
-                    contentPadding: EdgeInsets.zero,
-                    leading: const Icon(Icons.play_circle_outline_rounded),
-                    title: Text(player.name),
-                    subtitle: Text(
-                      player.isCustom
-                          ? externalPlayerExists(player.path)
-                                ? '自定义 · ${player.path}'
-                                : '文件不存在 · ${player.path}'
-                          : player.path,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                    onTap: () {
-                      Navigator.of(ctx).pop();
-                      unawaited(_openExternal(player));
-                    },
-                  ),
-              ],
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-
-  Future<void> _openExternal(ExternalPlayer player) async {
-    if (!externalPlayerExists(player.path)) {
-      _toast('找不到 ${player.name}；请在 设置 → 播放 → 自定义第三方播放器 重新选择');
-      return;
-    }
-    final cached = _currentPlay;
-    final play =
-        (cached != null && _currentPlayIndex == _index && cached.playable)
-        ? cached
-        : await _resolve(_index);
-    if (play == null || !play.playable) {
-      _toast(
-        play?.message.isNotEmpty == true ? play!.message : '当前地址无法交给外部播放器',
-      );
-      return;
-    }
-    if (!await _warmUpExternalPlay(play)) return;
-    try {
-      await _saveProgress();
-      final source = _app.preparePlay(play, forceRelay: true);
-      // 多集时把整份选集列表交给外部播放器（M3U 每项回指本机中继）。
-      final playlist = await _externalPlaylistPath(currentUrl: source.url);
-      final ok = launchExternalPlayer(
-        player.path,
-        playlist ?? source.url,
-        extraArgs: playlist == null
-            ? externalSeekArgs(player.id, _position.inSeconds)
-            : const [],
-      );
-      if (ok) {
-        // 外部播放器拿到的是本机 /chunk 地址：之后离开本页也不能回收取流 JVM。
-        _handedToExternalPlayer = true;
-        _app.sourceService.jar.holdPlaybackForExternal();
-        if (!mounted) return;
-        _toast(
-          playlist == null
-              ? '已在 ${player.name} 中打开'
-              : '已在 ${player.name} 中打开（共 ${_episodes.length} 集选集）',
-        );
-        // 外部播放器已经接手：关闭内置播放器页，避免原视频继续在后台播放/占解码器。
-        unawaited(_exitPage());
-        return;
-      }
-      _toast('启动 ${player.name} 失败');
-    } catch (e) {
-      _toast('$e');
-    }
-  }
-
-  /// 外部播放器接手 `/chunk` 之前先做一次探针，避免 PotPlayer 的多条
-  /// 连接同时触发壳内的会话竞态（详见 `JarSpiderService.warmUpLocalPlayUrl`）。
-  Future<bool> _warmUpExternalPlay(PlayResult play) async {
-    final url = play.url.trim();
-    final isChunk = url.contains('/chunk') && url.contains('127.0.0.1');
-    if (isChunk) _toast('正在准备取流地址…');
-    final ok = await _app.sourceService.jar.warmUpLocalPlayUrl(url);
-    if (!ok) _toast('取流地址准备失败，请重试一次');
-    return ok;
-  }
-
-  String _audioLabelOf(int? index) {
-    if (index == null) return '默认音轨';
-    for (final option in _audioOptions) {
-      if (option.index == index) return _audioLabel(option);
-    }
-    return '音轨 $index';
-  }
-
-  String _audioLabel(_AudioOption option) {
-    final parts = <String>[];
-    if (option.title.isNotEmpty) parts.add(option.title);
-    final lang = _languageLabel(option.language);
-    if (lang.isNotEmpty && !parts.contains(lang)) parts.add(lang);
-    if (parts.isEmpty) parts.add('音轨 ${option.index + 1}');
-    parts.add(option.codec.toUpperCase());
-    return parts.join(' · ');
-  }
-
-  String _languageLabel(String raw) {
-    final v = raw.trim().toLowerCase();
-    if (v.isEmpty || v == 'und' || v == 'unknown') return '';
-    if (v == 'chi' ||
-        v == 'zho' ||
-        v == 'chs' ||
-        v == 'cht' ||
-        v.startsWith('zh')) {
-      return '中文';
-    }
-    if (v == 'eng' || v.startsWith('en')) return '英语';
-    if (v == 'jpn' || v.startsWith('ja')) return '日语';
-    if (v == 'kor' || v.startsWith('ko')) return '韩语';
-    if (v == 'fra' || v == 'fre' || v.startsWith('fr')) return '法语';
-    if (v == 'deu' || v == 'ger' || v.startsWith('de')) return '德语';
-    if (v == 'spa' || v.startsWith('es')) return '西班牙语';
-    if (v == 'rus' || v.startsWith('ru')) return '俄语';
-    return raw;
-  }
-
-  Future<void> _showSpeed() async {
-    const rates = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
-    await showModalBottomSheet<void>(
-      context: context,
-      builder: (ctx) => SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(20, 4, 20, 20),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text('播放速度', style: Theme.of(ctx).textTheme.titleLarge),
-              const SizedBox(height: 12),
-              Wrap(
-                spacing: 8,
-                runSpacing: 8,
-                children: [
-                  for (final r in rates)
-                    ChoiceChip(
-                      label: Text('${r}x'),
-                      selected: _rate == r,
-                      onSelected: (_) async {
-                        final app = _app;
-                        Navigator.of(ctx).pop();
-                        setState(() => _rate = r);
-                        await _controller?.setPlaybackSpeed(r);
-                        await app.setPlayerSettings(
-                          app.playerSettings.copyWith(speed: r),
-                        );
-                      },
-                    ),
-                ],
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
 }
 
 class _AudioOption {
