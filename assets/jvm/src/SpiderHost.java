@@ -1028,10 +1028,12 @@ public class SpiderHost {
 
       boolean flipped = false;
       // ① 主开关：Cloud_quark.tF = true
+      String[] guardClasses = {"com.github.catvod.spider.Cloud_quark", "com.github.catvod.spider.Cloud_uc", "com.github.catvod.spider.Cloud_ucpan", "com.github.catvod.spider.Cloud_baidu", "com.github.catvod.spider.Cloud_115", "com.github.catvod.spider.Cloud_ali", "com.github.catvod.spider.Cloud_thunder", "com.github.catvod.spider.Cloud_guangya"};
+      for (String clsName : guardClasses) {
       for (ClassLoader cl : loaders) {
         if (cl == null) continue;
         try {
-          Class<?> cq = Class.forName("com.github.catvod.spider.Cloud_quark", true, cl);
+          Class<?> cq = Class.forName(clsName, true, cl);
           java.lang.reflect.Field f = cq.getDeclaredField("tF");
           if (f.getType() != boolean.class) continue;
           f.setAccessible(true);
@@ -1041,6 +1043,7 @@ public class SpiderHost {
           // 该加载器看不到 Cloud_quark（不是这个壳 / 不是 quark 系）—— 换下一个
         }
       }
+      }
       if (flag == null || flag.isEmpty()) {
         if (flipped) System.err.println("[LoginGuard] 已置 tF=true（跳过网盘登录校验）");
         return;
@@ -1049,8 +1052,11 @@ public class SpiderHost {
       String[] owners = {
           "com.github.catvod.spider.Cloud_quark",
           "com.github.catvod.spider.merge.QB",
+        "com.github.catvod.spider.Cloud_uc",
+        "com.github.catvod.spider.Cloud_ucpan",
+        "com.github.catvod.spider.Cloud_baidu",
       };
-      String[] fields = {"N", "G4"};
+      String[] fields = {"N", "G4", "N", "N", "N""};
       for (int i = 0; i < owners.length; i++) {
         for (ClassLoader cl : loaders) {
           if (cl == null) continue;
@@ -1099,8 +1105,10 @@ public class SpiderHost {
           .invoke(sp, r.length > 0 ? r[0] : "", r.length > 1 ? r[1] : "1", true, extend);
     }
     if ("detailContent".equals(method)) {
+      String rawId = r.length > 0 ? r[0] : "";
+      java.util.List<String> ids = (r.length > 1) ? Arrays.asList(r) : (rawId.contains("$$$") || rawId.contains("://") || rawId.startsWith("{")) ? java.util.Collections.singletonList(rawId) : Arrays.asList(rawId.split(","));
       return (String) sp.getClass().getMethod("detailContent", List.class)
-          .invoke(sp, Arrays.asList((r.length > 0 ? r[0] : "").split(",")));
+          .invoke(sp, ids);
     }
     if ("searchContent".equals(method)) {
       String wd = r.length > 0 ? r[0] : "";

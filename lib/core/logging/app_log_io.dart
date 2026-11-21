@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
@@ -110,6 +111,41 @@ class AppLog {
         await Process.run('xdg-open', [dir.path]);
       }
     } catch (_) {}
+  }
+
+  static const _androidChannel =
+      MethodChannel('com.kniephos.kniephos/sleep_inhibitor');
+
+  /// Android 端一键导出最新日志文件到公共「下载/MisaTV」目录；
+  /// 非 Android 平台返回 null（调用方继续走 openDirectory）。
+  static Future<String?> exportLatestLog() async {
+    if (!Platform.isAndroid) return null;
+    await flush();
+    File? target;
+    final cur = currentFile;
+    if (cur.isNotEmpty) {
+      final f = File(cur);
+      if (f.existsSync()) target = f;
+    }
+    if (target == null && _dir != null && _dir!.existsSync()) {
+      final logs = _dir!
+          .listSync()
+          .whereType<File>()
+          .where((f) => f.path.endsWith('.log'))
+          .toList()
+        ..sort((a, b) => b.lastModifiedSync().compareTo(a.lastModifiedSync()));
+      if (logs.isNotEmpty) target = logs.first;
+    }
+    if (target == null) return '';
+    final now = DateTime.now();
+    String two(int n) => n.toString().padLeft(2, '0');
+    final stamp =
+        '${now.year}-${two(now.month)}-${two(now.day)}_${two(now.hour)}${two(now.minute)}${two(now.second)}';
+    final name = 'misatv-$stamp.log';
+    return _androidChannel.invokeMethod<String>('exportLogFile', {
+      'path': target.path,
+      'name': name,
+    });
   }
 
   static void _write(

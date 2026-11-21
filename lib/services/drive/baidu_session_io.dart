@@ -10,7 +10,7 @@ const _baiduUa =
 const _baiduReferer = 'https://pan.baidu.com/';
 const _baiduTokenUrl =
     'https://pan.baidu.com/api/gettemplatevariable'
-    '?fields=%5B%22bdstoken%22%5D&channel=chunlei&web=1&app_id=250528'
+    '?fields=%5B%22bdstoken%22%2C%22uk%22%5D&channel=chunlei&web=1&app_id=250528'
     '&clienttype=0';
 
 /// 探测百度登录态并吸收响应里的新 Cookie（不写盘，调用方决定是否保存）。
@@ -51,10 +51,13 @@ Future<QuarkSessionResult> refreshBaiduSession(String cookie) async {
     // -6 = 未登录 / 会话失效；其它负值是接口临时错误，不能误判成游客态。
     final guest = errno == -6;
     final merged = mergeSetCookies(base, setCookies);
+    final resMap = json?['result'];
+    final uk = resMap is Map ? '${resMap['uk'] ?? ''}'.trim() : '';
     return QuarkSessionResult(
       cookie: merged,
       changed: merged != original,
       valid: valid ? true : (guest ? false : null),
+      userId: uk,
     );
   } catch (_) {
     return QuarkSessionResult(cookie: original, changed: false, valid: null);

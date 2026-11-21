@@ -2153,16 +2153,42 @@ class SettingsPageState extends State<SettingsPage> {
                               : app.clearSearchHistory,
                         ),
                         const Divider(height: 24),
-                        _ActionRow(
-                          icon: Icons.folder_open_rounded,
-                          title: '运行日志',
-                          subtitle: AppLog.directory.isEmpty
-                              ? 'Web 版不写本地日志'
-                              : '${AppLog.directory}（按天分文件，保留 14 天）',
-                          onTap: AppLog.directory.isEmpty
-                              ? null
-                              : () => AppLog.openDirectory(),
-                        ),
+                      _ActionRow(
+                                icon: Icons.folder_open_rounded,
+                                title: '运行日志',
+                                subtitle: AppLog.directory.isEmpty
+                                    ? 'Web 版不写本地日志'
+                                    : '${AppLog.directory}（点此打开目录或导出到下载/MisaTV）',
+                                onTap: AppLog.directory.isEmpty
+                                    ? null
+                                    : () async {
+                                        try {
+                                          final exported =
+                                              await AppLog.exportLatestLog();
+                                          if (exported != null) {
+                                            if (!context.mounted) return;
+                                            final msg = exported.isEmpty
+                                                ? '暂无可导出的日志文件'
+                                                : '已导出运行日志到：$exported';
+                                            ScaffoldMessenger.of(context)
+                                                .showSnackBar(
+                                              SnackBar(content: Text(msg)),
+                                            );
+                                            return;
+                                          }
+                                        } catch (e) {
+                                          if (context.mounted) {
+                                            ScaffoldMessenger.of(context)
+                                                .showSnackBar(
+                                              SnackBar(
+                                                  content: Text('导出日志失败：$e')),
+                                            );
+                                          }
+                                          return;
+                                        }
+                                        await AppLog.openDirectory();
+                                      },
+                              ),
                       ],
                     ),
                   ),

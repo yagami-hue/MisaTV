@@ -51,6 +51,29 @@ class _DriveCookieDialogState extends State<_DriveCookieDialog> {
 
   Future<void> _save() async {
     final app = AppScope.of(context);
+    if (isTokenDriveProvider(_provider)) {
+      final normalized = normalizeDriveTokenInput(_controller.text);
+      if (normalized.isEmpty) {
+        setState(() => _error = '请输入 Token');
+        return;
+      }
+      setState(() {
+        _saving = true;
+        _error = '';
+      });
+      try {
+        await app.saveDriveAccount(_provider, normalized);
+        if (!mounted) return;
+        Navigator.of(context).pop(true);
+      } catch (e) {
+        if (!mounted) return;
+        setState(() {
+          _saving = false;
+          _error = '保存失败: $e';
+        });
+      }
+      return;
+    }
     final cookie = normalizeDriveCookieInput(_controller.text);
     if (cookie.isEmpty) {
       setState(() => _error = '请粘贴 Cookie，格式形如 a=b; c=d');
@@ -112,7 +135,7 @@ class _DriveCookieDialogState extends State<_DriveCookieDialog> {
       height: 1.6,
     );
     return AlertDialog(
-      title: Text('手动输入 Cookie · $_name'),
+      title: Text(isTokenDriveProvider(_provider) ? '手动输入 Token · $_name' : '手动输入 Cookie · $_name'),
       content: SizedBox(
         width: 640,
         child: SingleChildScrollView(

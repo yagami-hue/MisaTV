@@ -12,11 +12,13 @@ class QuarkSessionResult {
     required this.cookie,
     required this.changed,
     this.valid,
+    this.userId = '',
   });
 
   final String cookie;
   final bool changed;
   final bool? valid;
+  final String userId;
 }
 
 const _ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '

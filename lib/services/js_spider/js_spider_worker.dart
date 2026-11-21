@@ -200,6 +200,16 @@ class _JsWorker {
     channels['__b64d'] = (dynamic payload) =>
         _b64Decode(((payload as Map)['s'] ?? '').toString());
     js.evaluate(spiderJsBootstrap, name: 'kniephos:bootstrap');
+js.evaluate(
+  "if (typeof globalThis.SpiderDebug === 'undefined') { "
+  "globalThis.SpiderDebug = { "
+  "log: function() { try { if (typeof console !== 'undefined' && console.log) console.log.apply(console, arguments); } catch (_) {} }, "
+  "info: function() { try { if (typeof console !== 'undefined' && (console.info || console.log)) (console.info || console.log).apply(console, arguments); } catch (_) {} }, "
+  "warn: function() { try { if (typeof console !== 'undefined' && (console.warn || console.log)) (console.warn || console.log).apply(console, arguments); } catch (_) {} }, "
+  "error: function() { try { if (typeof console !== 'undefined' && (console.error || console.log)) (console.error || console.log).apply(console, arguments); } catch (_) {} } "
+  "}; }",
+  name: 'kniephos:spider_debug',
+);
     return _SiteRuntime(api: api, hash: scriptHash, ext: ext, js: js);
   }
 

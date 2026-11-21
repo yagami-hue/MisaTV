@@ -485,7 +485,7 @@ class TorrentPlay implements BtStreamSource {
       return const BtPlayOutcome.unsupported('本地播放中继未启动，无法把磁力流转给播放器');
     }
     final url = btStreamUrl(relay.baseUrl, session.infoHash, session.fileIndex);
-    final block = webPlayBlockReason(session.fileName);
+    final block = Platform.isAndroid ? null : webPlayBlockReason(session.fileName);
     if (block == null) {
       return BtPlayOutcome.inline(
         url: url,
@@ -519,7 +519,7 @@ class TorrentPlay implements BtStreamSource {
     }
     // 云端直链通常要求迅雷下载 UA；套上中继让内置/外部播放器都能带上。
     final url = relay.playUrl(play.url, headers: play.headers);
-    final block = webPlayBlockReason(play.fileName);
+    final block = Platform.isAndroid ? null : webPlayBlockReason(play.fileName);
     if (block == null) {
       return BtPlayOutcome.inline(
         url: url,

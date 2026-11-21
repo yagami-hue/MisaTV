@@ -30,21 +30,26 @@ class SpiderEnv {
   SpiderEnv._();
 
   /// wex 文件通道：provider → 文件名（裸 cookie）。
-  static const _wexFiles = <String, String>{
-    'quark': '.quarkcookie',
-    'uc': '.ucpancookie',
+  static const _wexFiles = <String, List<String>>{
+    'quark': ['.quarkcookie', 'quark_cookie.txt'],
+    'uc': ['.ucpancookie', 'uc_cookie.txt'],
+    'baidu': ['.baiducookie', 'baidu_cookie.txt', 'baidu.txt'],
     // 115 属于同一族的「网盘直连」，文件名为约定俗成的 `.115cookie`；
     // 不认识它的 jar 只会忽略这个文件，不会因此报错。
-    '115': '.115cookie',
-  };
+    '115': ['.115cookie', '115_cookie.txt'],
+    'thunder': ['.xunleitoken', '.xunleicookie', '.thundertoken', 'xunlei_token.txt', 'xunlei_cookie.txt', 'thunder_token.txt', 'xunlei.txt'],
+    'guangya': ['.guangyatoken', '.guangyacookie', 'guangya_token.txt', 'guangya_cookie.txt', 'guangya.txt'],
+    };
 
   /// wex SharedPreferences 键：provider → `Wex_*` 键名。
-  static const _wexPrefKeys = <String, String>{
-    'quark': 'Wex_quark_cookie',
-    'uc': 'Wex_ucpan_cookie',
-    'baidu': 'Wex_baidu_cookie',
-    '115': 'Wex_115_cookie',
-  };
+  static const _wexPrefKeys = <String, List<String>>{
+    'quark': ['Wex_quark_cookie'],
+    'uc': ['Wex_ucpan_cookie'],
+    'baidu': ['Wex_baidu_cookie'],
+    '115': ['Wex_pan115_cookie', 'Wex_115_cookie'],
+    'thunder': ['thunderCfg', 'Wex_thunder_token'],
+    'guangya': ['Wex_GuangYa_Cache', 'Wex_guangya_token'],
+    };
 
   static const _wexPrefsName = 'NewWexFnw_preferences';
 
@@ -55,6 +60,8 @@ class SpiderEnv {
   static const _siteCookieFiles = <String, String>{
     'bili': 'bili_cookie.txt',
     '115': '115.txt',
+    'thunder': 'xunlei_token.txt',
+    'guangya': 'guangya_token.txt',
   };
 
 
@@ -63,6 +70,7 @@ class SpiderEnv {
     'quark': 'quark_cookie.txt',
     'uc': 'uc_cookie.txt',
     'baidu': 'baidu.txt',
+    'aliyun': 'aliyun.txt',
   };
 
   /// 同步一次（文件都很小，每次调用都重写；内容未变时写入是幂等的）。
@@ -96,7 +104,7 @@ class SpiderEnv {
     // 各通道互相隔离：某一个文件被 JVM 占用时，不能让其余通道也不写。
     await _guard(() => _syncWexFiles(spiderCacheDir, normalized));
     await _guard(() => _syncWexSeed(spiderCacheDir, normalized, extra));
-    await _guard(() => _syncPizazzFiles(tmpDir ?? Directory.systemTemp.path, normalized));
+    await _guard(() => _syncPizazzFiles(tmpDir ?? Directory.systemTemp.path, normalized, extra));
     if (dataDir != null && dataDir.trim().isNotEmpty) {
       await _guard(() => _syncSiteCookieFiles(dataDir, normalized));
       await _guard(() => _syncCloudDrive(dataDir, normalized, ext));
@@ -114,15 +122,18 @@ class SpiderEnv {
   /// 通道 1：`<spiderCache>/files/TV/.quarkcookie`（裸 cookie，jar 里直接 trim 当 Cookie 用）。
   static Future<void> _syncWexFiles(String spiderCacheDir, Map<String, String> cookies) async {
     final dir = Directory(p.join(spiderCacheDir, 'files', 'TV'));
-    _wexFiles.forEach((provider, name) {
-      final file = File(p.join(dir.path, name));
+    _wexFiles.forEach((provider, names) {
       final value = cookies[provider] ?? '';
       if (value.isEmpty) {
-        _delete(file);
+        for (final name in names) {
+          _delete(File(p.join(dir.path, name)));
+        }
         return;
       }
       dir.createSync(recursive: true);
-      file.writeAsStringSync(value, flush: true);
+      for (final name in names) {
+        File(p.join(dir.path, name)).writeAsStringSync(value, flush: true);
+      }
     });
   }
 
@@ -135,8 +146,8 @@ class SpiderEnv {
     final file = File(p.join(spiderCacheDir, 'shared_prefs', 'seed.txt'));
     final lines = <String>[
       for (final entry in _wexPrefKeys.entries)
-        if ((cookies[entry.key] ?? '').isNotEmpty)
-          '$_wexPrefsName\t${entry.value}\t${_clean(cookies[entry.key]!)}',
+        if ((cookies[entry.key] ?? '').isNotEmpty) for (final prefKey in entry.value)
+          '$_wexPrefsName\t$prefKey\t${_clean(_formatWexPrefValue(prefKey, cookies[entry.key]!))}',
       for (final entry in seed.entries) '$_wexPrefsName\t${entry.key}\t${_clean(entry.value)}',
       // 桌面端没有 Go 代理（ARM32 + Android root 场景），强制 Java 多线程取流；
       // 否则原画线路必报「Go多线程启动失败」。
@@ -149,7 +160,48 @@ class SpiderEnv {
     file.parent.createSync(recursive: true);
     file.writeAsStringSync('${lines.join('\n')}\n', flush: true);
   }
-
+  static String _formatWexPrefValue(String prefKey, String raw) {
+    if (prefKey != 'Wex_GuangYa_Cache' && prefKey != 'thunderCfg') return raw;
+final trimmed = raw.trim();
+Map<String, dynamic>? m;
+if (trimmed.startsWith('{')) {
+try {
+final decoded = jsonDecode(trimmed);
+if (decoded is Map) m = decoded.map((k, v) => MapEntry('$k', v));
+} catch (_) {}
+}
+String pick(String a, String b, [String fallback = '']) {
+final v = '${m?[a] ?? m?[b] ?? ''}'.trim();
+return v.isNotEmpty ? v : fallback;
+}
+if (prefKey == 'Wex_GuangYa_Cache') {
+return jsonEncode({
+'token_type': pick('token_type', 'tokenType', 'Bearer'),
+'access_token': m == null ? '' : pick('access_token', 'accessToken'),
+'refresh_token': m == null ? trimmed : pick('refresh_token', 'refreshToken'),
+});
+}
+    final deviceId = pick('deviceId', 'device_id');
+    final deviceSign = pick('deviceSign', 'device_sign');
+    final peerId = pick('peerId', 'peer_id');
+   final resp = (m?['token_resp'] is Map) ? (m!['token_resp'] as Map).map((k, v) => MapEntry('$k', v)) : m;
+   String pickResp(String a, String b, [String fallback = '']) { final v = '${resp?[a] ?? resp?[b] ?? ''}'.trim(); return v.isNotEmpty ? v : fallback; }
+   final accessToken = resp == null ? '' : pickResp('accessToken', 'access_token'); final rawUserId = pickResp('userId', 'user_id'); final userId = rawUserId.isNotEmpty ? rawUserId : pickResp('sub', 'sub'); int expireTime = 0; final rawExpire = num.tryParse('${resp?['expireTime'] ?? resp?['expires_end'] ?? 0}')?.toInt() ?? 0; if (rawExpire > 0) { expireTime = rawExpire < 1000000000000 ? rawExpire * 1000 : rawExpire; } else { final expiresIn = num.tryParse('${resp?['expires_in'] ?? 0}')?.toInt() ?? 0; if (expiresIn > 0) expireTime = DateTime.now().millisecondsSinceEpoch + expiresIn * 1000; }
+    return jsonEncode({
+      'accessToken': accessToken,
+      'refreshToken': resp == null ? trimmed : pickResp('refreshToken', 'refresh_token'),
+      'tokenType': pickResp('tokenType', 'token_type', 'Bearer'),
+      'userId': userId,
+      'expireTime': expireTime,
+      'authVersion': 'downloadprovider-25.0.6.30',
+      'authPackage': 'com.xunlei.downloadprovider',
+      'authClientId': 'Xp6vsxz_7IYVw2BB',
+      if (deviceId.isNotEmpty) 'deviceId': deviceId,
+      if (deviceSign.isNotEmpty) 'deviceSign': deviceSign,
+      if (peerId.isNotEmpty) 'peerId': peerId,
+    });
+  }
+  
   /// 通道 5：`<数据目录>/TVBox/{bili_cookie,115}.txt`（裸 cookie 串）。
   ///
   /// 哔哩系蜘蛛的 ext 直接写 `http://127.0.0.1:9978/file/TVBox/bili_cookie.txt`，
@@ -173,11 +225,11 @@ class SpiderEnv {
   }
 
   /// 通道 3：`<java.io.tmpdir>/tvbox-ext/TVBox/*.txt`（JSON 对象，键 `cookie`）。
-  static Future<void> _syncPizazzFiles(String tmpDir, Map<String, String> cookies) async {
+  static Future<void> _syncPizazzFiles(String tmpDir, Map<String, String> cookies, Map<String, String> seed) async {
     final dir = Directory(p.join(tmpDir, 'tvbox-ext', 'TVBox'));
     for (final entry in _pizazzFiles.entries) {
       final file = File(p.join(dir.path, entry.value));
-      final value = cookies[entry.key] ?? '';
+      final value = (cookies[entry.key] ?? (entry.key == 'aliyun' ? cookies['ali'] : null) ?? '');
       if (value.isEmpty) {
         _delete(file);
         continue;
@@ -185,27 +237,90 @@ class SpiderEnv {
       // quark / uc 的登录判定是「三字段均非空」→ 保留旧文件里的真实昵称/会员态，缺省占位。
       var nickname = 'MisaTV';
       var memberType = '1';
-      if (entry.key == 'quark' || entry.key == 'uc') {
-        try {
+      var userId = '';
+      var username = '';
+      try {
           final old = jsonDecode(file.readAsStringSync());
           if (old is Map) {
             final n = '${old['nickname'] ?? ''}'.trim();
             final t = '${old['member_type'] ?? ''}'.trim();
             if (n.isNotEmpty) nickname = n;
             if (t.isNotEmpty) memberType = t;
+            final u = '${old['userId'] ?? ''}'.trim();
+            final un = '${old['username'] ?? ''}'.trim();
+            if (u.isNotEmpty) userId = u;
+            if (un.isNotEmpty) username = un;
           }
         } catch (_) {
           // 无旧文件 / 内容损坏 → 用占位
-        }
       }
       final body = <String, dynamic>{'cookie': value};
       if (entry.key == 'quark' || entry.key == 'uc') {
         body['nickname'] = nickname;
         body['member_type'] = memberType;
       }
+    if (entry.key == 'baidu' && (seed['baidu_user_id'] ?? '').isNotEmpty) userId = seed['baidu_user_id']!;
+      if (userId.isNotEmpty) body['userId'] = userId;
+      if (username.isNotEmpty) body['username'] = username;
       dir.createSync(recursive: true);
       file.writeAsStringSync(jsonEncode(body), flush: true);
     }
+  const tokenFiles = {'thunder': 'xunlei.txt', 'guangya': 'guangya.txt'};
+for (final entry in tokenFiles.entries) {
+  final file = File(p.join(dir.path, entry.value));
+  final raw = (cookies[entry.key] ?? '').trim();
+  if (raw.isEmpty) {
+    _delete(file);
+    continue;
+  }
+  var tokenType = 'Bearer';
+  var accessToken = raw;
+  var refreshToken = '';
+  var sub = '';
+  var expiresIn = 7200;
+  var deviceId = '';
+  if (raw.startsWith('{')) {
+    try {
+      final src = jsonDecode(raw);
+      if (src is Map) {
+        final resp = src['token_resp'] is Map ? src['token_resp'] as Map : src;
+        final at = '${resp['access_token'] ?? resp['accessToken'] ?? ''}'.trim();
+        if (at.isNotEmpty) accessToken = at;
+        refreshToken = '${resp['refresh_token'] ?? resp['refreshToken'] ?? ''}'.trim();
+        final tt = '${resp['token_type'] ?? resp['tokenType'] ?? ''}'.trim();
+        if (tt.isNotEmpty) tokenType = tt;
+        sub = '${resp['sub'] ?? resp['userId'] ?? ''}'.trim();
+        final expRaw = resp['expires_in'] ?? resp['expireTime'];
+        final exp = expRaw is num ? expRaw.toInt() : int.tryParse('${expRaw ?? ''}') ?? 7200;
+        if (exp > 0) expiresIn = exp;
+        deviceId = '${src['deviceid'] ?? src['deviceId'] ?? ''}'.trim();
+      }
+    } catch (_) {}
+  }
+  if (deviceId.isEmpty) {
+    final seed = utf8.encode('MisaTV:${entry.key}:$accessToken');
+    final bytes = List<int>.filled(16, 0);
+    for (var i = 0; i < seed.length; i++) {
+      bytes[i % 16] = (bytes[i % 16] * 31 + seed[i] + i) & 0xff;
+    }
+    deviceId = bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+  }
+  final expiresEnd = DateTime.now().millisecondsSinceEpoch + expiresIn * 1000;
+  final payload = {
+    'token_resp': {
+      'token_type': tokenType,
+      'access_token': accessToken,
+      'refresh_token': refreshToken,
+      'sub': sub,
+      'expires_in': expiresIn,
+      'expires_end': expiresEnd,
+    },
+    'deviceid': deviceId,
+    'username': 'MisaTV',
+  };
+  dir.createSync(recursive: true);
+  file.writeAsStringSync(jsonEncode(payload), flush: true);
+}
   }
 
   /// 通道 4：fty 系 `Cloud-drive` 配置（源在 init 时读取 quarkCookie / ucCookie）。
@@ -234,10 +349,31 @@ class SpiderEnv {
       // 凭据键必须完全由当前绑定状态决定：解绑后不能留着旧 Cookie。
       obj.remove('quarkCookie');
       obj.remove('ucCookie');
+      obj.remove('baiduCookie');
+      obj.remove('115Cookie');
+      obj.remove('biliCookie');
+      obj.remove('xunleiToken');
+      obj.remove('xunleiCookie');
+      obj.remove('thunderCookie');
+      obj.remove('guangyaToken');
+      obj.remove('guangyaCookie');
       final quark = cookies['quark'] ?? '';
       final uc = cookies['uc'] ?? '';
+      final baidu = cookies['baidu'] ?? '';
+      final pan115 = cookies['115'] ?? '';
+      final bili = cookies['bili'] ?? '';
+      final thunder = cookies['thunder'] ?? '';
+      final guangya = cookies['guangya'] ?? '';
       if (quark.isNotEmpty) obj['quarkCookie'] = quark;
-      if (uc.isNotEmpty) obj['ucCookie'] = uc;
+      if (uc.isNotEmpty) obj['ucCookie']       = uc;
+      if (baidu.isNotEmpty) obj['baiduCookie'] = baidu;
+      if (pan115.isNotEmpty) obj['115Cookie'] = pan115;
+      if (bili.isNotEmpty) obj['biliCookie'] = bili;
+      if (thunder.isNotEmpty) obj['xunleiToken'] = thunder;
+      if (thunder.isNotEmpty) obj['xunleiCookie'] = thunder;
+      if (thunder.isNotEmpty) obj['thunderCookie'] = thunder;
+      if (guangya.isNotEmpty) obj['guangyaToken'] = guangya;
+      if (guangya.isNotEmpty) obj['guangyaCookie'] = guangya;
       try {
         file.parent.createSync(recursive: true);
         file.writeAsStringSync(jsonEncode(obj), flush: true);

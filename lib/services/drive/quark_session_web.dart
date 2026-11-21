@@ -4,11 +4,13 @@ class QuarkSessionResult {
     required this.cookie,
     required this.changed,
     this.valid,
+    this.userId = '',
   });
 
   final String cookie;
   final bool changed;
   final bool? valid;
+  final String userId;
 }
 
 String mergeSetCookies(String base, Iterable<String> setCookies) => base;

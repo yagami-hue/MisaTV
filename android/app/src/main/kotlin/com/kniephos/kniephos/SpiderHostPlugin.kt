@@ -3,6 +3,7 @@ package com.kniephos.kniephos
 import android.app.Application
 import android.content.Context
 import android.content.ContextWrapper
+import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import io.flutter.embedding.engine.plugins.FlutterPlugin
@@ -69,7 +70,7 @@ class SpiderHostPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
     @Volatile private var driveCookies = mapOf<String, String>()
     @Volatile private var driveSeed = mapOf<String, String>()
     @Volatile private var driveCacheDir = ""
-
+        @Volatile private var managedDriveProviders = setOf<String>()
     // 壳自带的「宿主代理」本地端口（playerContent 返回的 127.0.0.1 地址要改写到这个端口）
     @Volatile private var proxyPort = 0
 
@@ -125,13 +126,15 @@ class SpiderHostPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
                     val className = call.argument<String>("className") ?: ""
                     val ext = call.argument<String>("ext") ?: ""
                     val cacheDir = call.argument<String>("cacheDir") ?: appContext?.cacheDir?.absolutePath ?: ""
-                    runAsync(result) { loadSpider(paths, className, ext, cacheDir) }
+                   val instanceKey = call.argument<String>("instanceKey") ?: ""
+                    runAsync(result) { loadSpider(paths, className, ext, cacheDir, instanceKey) }
                 }
                 "invoke" -> {
                     val method = call.argument<String>("method") ?: ""
                     val args = (call.argument<List<*>>("args") as? List<*>)?.mapNotNull { it?.toString() } ?: emptyList()
+                   val instanceKey = call.argument<String>("instanceKey") ?: ""
                     val className = call.argument<String>("className") ?: ""
-                    runAsync(result) { invoke(method, args, className) }
+                    runAsync(result) { invoke(method, args, className, instanceKey) }
                 }
                 "loadNative" -> {
                     val path = call.argument<String>("path") ?: ""
@@ -219,16 +222,20 @@ class SpiderHostPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
 
         // 通道 1：SharedPreferences（真实实现用 Init.context().getSharedPreferences）。
         val prefKeys = mapOf(
-            "quark" to "Wex_quark_cookie",
-            "uc" to "Wex_ucpan_cookie",
-            "baidu" to "Wex_baidu_cookie",
-            "115" to "Wex_115_cookie",
+            "quark" to listOf("Wex_quark_cookie"),
+            "uc" to listOf("Wex_ucpan_cookie"),
+            "baidu" to listOf("Wex_baidu_cookie"),
+            "115" to listOf("Wex_pan115_cookie", "Wex_115_cookie", "115_cookie", "cookie_115", "pan115_cookie"),
+            "thunder" to listOf("thunderCfg", "Wex_thunder_token"),
+            "guangya" to listOf("Wex_GuangYa_Cache", "Wex_guangya_token"),
         )
         try {
             val edit = ctx.getSharedPreferences("NewWexFnw_preferences", Context.MODE_PRIVATE).edit()
-            for ((provider, key) in prefKeys) {
-                val value = driveCookies[provider].orEmpty()
-                if (value.isEmpty()) edit.remove(key) else edit.putString(key, value)
+            for ((provider, keys) in prefKeys) {
+                val value = driveCookies[provider].orEmpty().ifEmpty { if (provider == "aliyun") driveCookies["ali"].orEmpty() else "" }
+                for (prefKey in keys) {
+                if (value.isEmpty()) { if (managedDriveProviders.contains(provider)) edit.remove(prefKey) } else edit.putString(prefKey, formatWexPrefValue(prefKey, value))
+                }
             }
             edit.putString("pan.thread_proxy_mode", "java")
             for ((k, v) in driveSeed) {
@@ -240,65 +247,197 @@ class SpiderHostPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         // 通道 2：裸 Cookie 文件。不同壳家族分别用 getFilesDir()/getDir("TV")/
         // spiderCacheDir 作为根，全部写一遍，解绑时删除。
         val fileNames = mapOf(
-            "quark" to ".quarkcookie",
-            "uc" to ".ucpancookie",
-            "115" to ".115cookie",
+            "quark" to listOf(".quarkcookie", "quark_cookie.txt"),
+            "uc" to listOf(".ucpancookie", "uc_cookie.txt"),
+            "baidu" to listOf(".baiducookie", "baidu_cookie.txt", "baidu.txt"),
+            "115" to listOf(".115cookie", "115_cookie.txt", "115.txt"),
+            "thunder" to listOf(".xunleitoken", ".xunleicookie", "xunlei_token.txt", "xunlei_cookie.txt", "xunlei.txt", ".thundertoken", "thunder_token.txt"),
+            "guangya" to listOf(".guangyatoken", ".guangyacookie", "guangya_token.txt", "guangya_cookie.txt", "guangya.txt", ".guangya", "guangyapan_token.txt"),
+            "bili" to listOf("bili_cookie.txt", ".bilicookie"),
         )
         val roots = mutableSetOf<File>()
         try {
             ctx.filesDir?.let { f ->
                 roots.add(File(f, "TV"))
                 roots.add(File(f, "files/TV"))
+                roots.add(File(f, "TVBox"))
             }
             roots.add(ctx.getDir("TV", Context.MODE_PRIVATE))
             roots.add(File(ctx.dataDir, "files/TV"))
+            roots.add(File(ctx.cacheDir, "TVBox"))
             roots.add(File(ctx.cacheDir, "files/TV"))
+            ctx.getExternalFilesDir(null)?.let { roots.add(File(it, "TVBox")) }
+            ctx.getExternalFilesDir(null)?.let { roots.add(File(it, "TV")) }
             if (driveCacheDir.isNotEmpty()) roots.add(File(driveCacheDir, "files/TV"))
         } catch (_: Throwable) {}
-        for ((provider, name) in fileNames) {
+        for ((provider, names) in fileNames) {
             val value = driveCookies[provider].orEmpty()
             for (root in roots) {
+                for (name in names) {
                 try {
                     val file = File(root, name)
                     if (value.isEmpty()) {
-                        file.delete()
+                        if (managedDriveProviders.contains(provider)) file.delete()
                     } else {
                         root.mkdirs()
                         file.writeText(value)
                     }
-                } catch (_: Throwable) {}
+                    } catch (_: Throwable) {}
+                }
             }
         }
 
         // 通道 3：Pizazz / 太太太硬了 家族的 JSON 三字段判定。
         try {
-            val dir = File(ctx.cacheDir, "tvbox-ext/TVBox").apply { mkdirs() }
-            val names = mapOf(
-                "quark" to "quark_cookie.txt",
-                "uc" to "uc_cookie.txt",
-                "baidu" to "baidu.txt",
-            )
-            for ((provider, name) in names) {
-                val value = driveCookies[provider].orEmpty()
-                val file = File(dir, name)
-                if (value.isEmpty()) {
-                    file.delete()
-                    continue
-                }
-                val obj = JSONObject()
-                    .put("cookie", value)
-                    .put("nickname", "MisaTV")
-                    .put("member_type", "1")
-                file.writeText(obj.toString())
+           val dirs = mutableListOf<File>()
+           runCatching { dirs.add(File(ctx.cacheDir, "tvbox-ext/TVBox").apply { mkdirs() }) }
+           runCatching { dirs.add(File(Environment.getExternalStorageDirectory(), "TVBox").apply { mkdirs() }) }
+val names = mapOf("quark" to "quark_cookie.txt", "uc" to "uc_cookie.txt", "baidu" to "baidu.txt", "aliyun" to "aliyun.txt", "thunder" to "xunlei_cookie.txt", "guangya" to "guangya_token.txt", "115" to "115.txt")
+            val tokenFiles = mapOf("thunder" to "xunlei.txt", "guangya" to "guangya.txt")
+for (dir in dirs) {
+    for ((provider, name) in names) {
+        runCatching {
+            val value = driveCookies[provider].orEmpty()
+            val file = File(dir, name)
+            if (value.isEmpty()) {
+               if (managedDriveProviders.contains(provider)) file.delete()
+                return@runCatching
             }
-        } catch (_: Throwable) {}
+            val obj = if (file.exists()) runCatching { JSONObject(file.readText()) }.getOrElse { JSONObject() } else JSONObject()
+                obj.put("cookie", value)
+                if (obj.optString("nickname").isEmpty()) obj.put("nickname", "MisaTV")
+                if (obj.optString("member_type").isEmpty()) obj.put("member_type", "1"); if (provider == "baidu" && driveSeed["baidu_user_id"].orEmpty().isNotEmpty()) obj.put("userId", driveSeed["baidu_user_id"].orEmpty())
+            file.writeText(obj.toString())
+        }
+    }
+    for ((provider, fileName) in tokenFiles) {
+        runCatching {
+            val raw = driveCookies[provider].orEmpty().trim()
+            val file = File(dir, fileName)
+            if (raw.isEmpty()) {
+               if (managedDriveProviders.contains(provider)) file.delete()
+                return@runCatching
+            }
+            var tokenType = "Bearer"
+            var accessToken = raw
+            var refreshToken = ""
+            var sub = ""
+            var expiresIn = 7200L
+            var deviceId = ""
+            if (raw.startsWith("{")) {
+                runCatching {
+                    val src = JSONObject(raw)
+                    val resp = src.optJSONObject("token_resp") ?: src
+                    accessToken = resp.optString("access_token").ifEmpty { resp.optString("accessToken") }
+                    refreshToken = resp.optString("refresh_token").ifEmpty { resp.optString("refreshToken") }
+                    tokenType = resp.optString("token_type").ifEmpty { resp.optString("tokenType") }.ifEmpty { "Bearer" }
+                    sub = resp.optString("sub").ifEmpty { resp.optString("userId") }
+                    val exp = resp.optLong("expires_in", resp.optLong("expireTime", 7200L))
+                    if (exp > 0L) expiresIn = exp
+                    deviceId = src.optString("deviceid").ifEmpty { src.optString("deviceId") }
+                }
+            }
+            if (deviceId.isEmpty()) {
+                val digest = java.security.MessageDigest.getInstance("MD5").digest("MisaTV:$provider:$accessToken".toByteArray())
+                deviceId = digest.joinToString("") { "%02x".format(it) }
+            }
+            val expiresEnd = System.currentTimeMillis() + expiresIn * 1000L
+            val tokenResp = JSONObject()
+                .put("token_type", tokenType)
+                .put("access_token", accessToken)
+                .put("refresh_token", refreshToken)
+                .put("sub", sub)
+                .put("expires_in", expiresIn)
+                .put("expires_end", expiresEnd)
+            val payload = JSONObject()
+                .put("token_resp", tokenResp)
+                .put("deviceid", deviceId)
+                .put("username", "MisaTV")
+            file.writeText(payload.toString())
+        }
+    }
+}
+
+        } catch (_: Throwable) {}; managedDriveProviders = driveCookies.filterValues { it.isNotEmpty() }.keys
     }
 
-    // ------------------------------------------------------------------
+    private fun formatWexPrefValue(prefKey: String, raw: String): String {
+        val trimmed = raw.trim()
+        return when (prefKey) {
+            "Wex_GuangYa_Cache" -> {
+                var tokenType = "Bearer"
+                var accessToken = ""
+                var refreshToken = ""
+                if (trimmed.startsWith("{")) {
+                    try {
+                        val obj = JSONObject(trimmed)
+                        tokenType = obj.optString("token_type").ifEmpty { obj.optString("tokenType") }.ifEmpty { "Bearer" }
+                        accessToken = obj.optString("access_token").ifEmpty { obj.optString("accessToken") }
+                        refreshToken = obj.optString("refresh_token").ifEmpty { obj.optString("refreshToken") }
+                    } catch (_: Throwable) {
+                        refreshToken = trimmed
+                    }
+                } else {
+                    refreshToken = trimmed
+                }
+                JSONObject().apply {
+                    put("token_type", tokenType)
+                    put("access_token", accessToken)
+                    put("refresh_token", refreshToken)
+                }.toString()
+            }
+            "thunderCfg" -> {
+                var accessToken = ""
+                var refreshToken = ""
+                var tokenType = "Bearer"
+                var userId = ""
+                var deviceId = ""
+                var deviceSign = ""
+                var peerId = ""
+                var expireTime = 0L
+                if (trimmed.startsWith("{")) {
+                    try {
+                        val obj = JSONObject(trimmed)
+                        val resp = obj.optJSONObject("token_resp") ?: obj
+                        accessToken = resp.optString("accessToken").ifEmpty { resp.optString("access_token") }
+                        refreshToken = resp.optString("refreshToken").ifEmpty { resp.optString("refresh_token") }
+                        tokenType = resp.optString("tokenType").ifEmpty { resp.optString("token_type") }.ifEmpty { "Bearer" }
+                        userId = resp.optString("userId").ifEmpty { resp.optString("user_id") }.ifEmpty { resp.optString("sub") }
+                        deviceId = obj.optString("deviceId").ifEmpty { obj.optString("device_id") }
+                        deviceSign = obj.optString("deviceSign").ifEmpty { obj.optString("device_sign") }
+                        peerId = obj.optString("peerId").ifEmpty { obj.optString("peer_id") }
+                       val rawExpire = resp.optLong("expireTime", 0L).let { if (it > 0L) it else resp.optLong("expires_end", 0L) }
+                       if (rawExpire > 0L) { expireTime = if (rawExpire < 1_000_000_000_000L) rawExpire * 1000L else rawExpire }
+                       else { val expiresIn = resp.optLong("expires_in", 0L); if (expiresIn > 0L) expireTime = System.currentTimeMillis() + expiresIn * 1000L }
+                    } catch (_: Throwable) {
+                        refreshToken = trimmed
+                    }
+                } else {
+                    refreshToken = trimmed
+                }
+                JSONObject().apply {
+                    put("accessToken", accessToken)
+                    put("refreshToken", refreshToken)
+                    put("tokenType", tokenType)
+                    put("userId", userId)
+                    put("expireTime", expireTime)
+                    put("authVersion", "downloadprovider-25.0.6.30")
+                    put("authPackage", "com.xunlei.downloadprovider")
+                    put("authClientId", "Xp6vsxz_7IYVw2BB")
+                    if (deviceId.isNotEmpty()) put("deviceId", deviceId)
+                    if (deviceSign.isNotEmpty()) put("deviceSign", deviceSign)
+                    if (peerId.isNotEmpty()) put("peerId", peerId)
+                }.toString()
+            }
+            else -> raw
+        }
+    }
+
+    // -------------------------------------------------------------------------
     // 加载并初始化蜘蛛
     // ------------------------------------------------------------------
     @Synchronized   // 加固壳首次解包很贵，串行加载避免多个源同时触发重复解包
-    private fun loadSpider(paths: List<String>, className: String, ext: String, cacheDir: String): Map<String, Any?> {
+    private fun loadSpider(paths: List<String>, className: String, ext: String, cacheDir: String, instanceKey: String = ""): Map<String, Any?> {
         return try {
             // 壳的 init(Context, ext) 会把网盘 Cookie 读进内存，必须先写好凭据。
             if (cacheDir.isNotEmpty()) driveCacheDir = cacheDir
@@ -339,8 +478,11 @@ class SpiderHostPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
                 )
             }
 
-            if (spiders.containsKey(className)) {
-                lastClassName = className
+            startProxy()
+
+            val cacheKey = instanceKey.ifEmpty { className }
+            if (spiders.containsKey(cacheKey)) {
+                lastClassName = cacheKey
                 return mapOf("ok" to true, "proxyPort" to proxyPort)
             }
 
@@ -372,8 +514,8 @@ class SpiderHostPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
                     clazz.getMethod("initApi", apiCls).invoke(instance, api)
                 } catch (_: Throwable) { /* 多数蜘蛛没有 initApi */ }
 
-                spiders[className] = SpiderHolder(instance, clazz, loader)
-                lastClassName = className
+                spiders[cacheKey] = SpiderHolder(instance, clazz, loader)
+                lastClassName = cacheKey
 
                 // 启动进程内宿主代理（加固壳 / 哔哩聚合源会用 127.0.0.1 回放地址）
                 startProxy()
@@ -390,8 +532,8 @@ class SpiderHostPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
     // ------------------------------------------------------------------
     // 反射调用蜘蛛方法（对齐 SpiderHost.java dispatchMethod）
     // ------------------------------------------------------------------
-    private fun invoke(method: String, args: List<String>, className: String = ""): Map<String, Any?> {
-        val name = className.ifEmpty { lastClassName ?: "" }
+    private fun invoke(method: String, args: List<String>, className: String = "", instanceKey: String = ""): Map<String, Any?> {
+        val name = instanceKey.ifEmpty { className.ifEmpty { lastClassName ?: "" } }
         val holder = spiders[name] ?: return errMap("蜘蛛尚未加载：$name")
         val sp = holder.instance
         val clazz = holder.clazz
@@ -429,7 +571,8 @@ class SpiderHostPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
                     ) as? String ?: ""
                 }
                 "detailContent" -> {
-                    val ids = (args.getOrNull(0) ?: "").split(",").toMutableList()
+                    val rawId = args.getOrNull(0) ?: ""
+                    val ids = if (args.size > 1) args.toMutableList() else if (rawId.contains("$$$") || rawId.contains("://") || rawId.startsWith("{")) mutableListOf(rawId) else rawId.split(",").toMutableList()
                     clazz.getMethod("detailContent", List::class.java)
                         .invoke(sp, ids) as? String ?: ""
                 }
@@ -502,22 +645,26 @@ class SpiderHostPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
     // ------------------------------------------------------------------
     // 进程内宿主代理（最小 HTTP server，转发 /proxy）
     // ------------------------------------------------------------------
+    @Synchronized
     private fun startProxy() {
-        if (proxyServer != null) return
+        val existing = proxyServer
+        if (existing != null && !existing.isClosed && proxyPort > 0) return
         try {
-            val server = ServerSocket(0, 0, java.net.InetAddress.getLoopbackAddress())
+            val server = ServerSocket(0, 50, java.net.InetAddress.getLoopbackAddress())
             proxyPort = server.localPort
             proxyServer = server
             proxyExecutor.execute {
-                try {
-                    while (!server.isClosed) {
+                while (!server.isClosed) {
+                    try {
                         val sock = server.accept() ?: break
                         proxyExecutor.execute { handleProxy(sock) }
+                    } catch (_: Throwable) {
+                        if (server.isClosed) break
                     }
-                } catch (_: Throwable) { /* server 关闭 */ }
+                }
             }
         } catch (_: Throwable) {
-            // 绑定失败不致命：只影响加固壳/聚合源的 127.0.0.1 回放地址
+            proxyServer = null
             proxyPort = 0
         }
     }
@@ -530,58 +677,178 @@ class SpiderHostPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
 
     private fun handleProxy(sock: java.net.Socket) {
         try {
-            sock.soTimeout = 30000
-            val reader = sock.getInputStream().bufferedReader()
-            val requestLine = reader.readLine() ?: return
-            val parts = requestLine.split(" ")
-            if (parts.size < 2) { sock.close(); return }
-            val uri = java.net.URI.create("http://localhost" + parts[1])
-            val params = LinkedHashMap<String, String>()
-            uri.query?.split("&")?.forEach { pair ->
-                val eq = pair.indexOf('=')
-                if (eq > 0) params[decode(pair.substring(0, eq))] = decode(pair.substring(eq + 1))
+      sock.soTimeout = 30000
+val reader = sock.getInputStream().bufferedReader()
+val requestLine = reader.readLine() ?: return
+val parts = requestLine.split(" ")
+if (parts.size < 2) { sock.close(); return }
+            val isHead = parts[0].equals("HEAD", ignoreCase = true)
+val uri = java.net.URI.create("http://localhost" + parts[1])
+val params = LinkedHashMap<String, String>()
+uri.query?.split("&")?.forEach { pair ->
+    val eq = pair.indexOf('=')
+    if (eq > 0) params[decode(pair.substring(0, eq))] = decode(pair.substring(eq + 1))
+}
+val rawPath = uri.rawPath ?: ""
+            if (rawPath.startsWith("/proxy/")) {
+                val sub = rawPath.removePrefix("/proxy/")
+val slashIdx = sub.indexOf('/')
+val firstRaw = if (slashIdx >= 0) sub.substring(0, slashIdx) else sub
+val restRaw = if (slashIdx >= 0) sub.substring(slashIdx + 1) else ""
+val firstSeg = java.net.URLDecoder.decode(firstRaw, "UTF-8")
+val restPath = java.net.URLDecoder.decode(restRaw, "UTF-8")
+if (firstSeg.isNotEmpty() && !params.containsKey("do")) params["do"] = firstSeg
+params["path"] = java.net.URLDecoder.decode(sub, "UTF-8")
+params["uri"] = rawPath
+if (restPath.isNotEmpty()) params["subpath"] = restPath
             }
-            val out = invokeProxy(params)
-            val body = out.second ?: byteArrayOf()
-            val headers = buildString {
-                append("HTTP/1.1 ${out.first}\r\n")
-                append("Content-Length: ${body.size}\r\n")
-                append("Access-Control-Allow-Origin: *\r\n")
-                append("Connection: close\r\n\r\n")
-            }
-            sock.getOutputStream().write(headers.toByteArray())
-            sock.getOutputStream().write(body)
-            sock.getOutputStream().flush()
-        } catch (_: Throwable) {
-            try { sock.close() } catch (_: Throwable) {}
-        } finally {
-            try { sock.close() } catch (_: Throwable) {}
+while (true) {
+    val line = reader.readLine() ?: break
+    if (line.isEmpty()) break
+    val colon = line.indexOf(':')
+    if (colon > 0) {
+        val key = line.substring(0, colon).trim().lowercase()
+        val value = line.substring(colon + 1).trim()
+        if (key.isNotEmpty() && !params.containsKey(key)) {
+            params[key] = value
+        }
+    }
+}
+val out = if (params["do"] == "ck") ProxyResponse(200, "text/plain; charset=utf-8", "ok".toByteArray(), null, emptyMap()) else invokeProxy(params)
+val hasContentTypeHeader = out.headers.keys.any { it.equals("Content-Type", ignoreCase = true) }
+val hasContentLengthHeader = out.headers.keys.any { it.equals("Content-Length", ignoreCase = true) }
+val hasCorsHeader = out.headers.keys.any { it.equals("Access-Control-Allow-Origin", ignoreCase = true) }
+val headers = buildString {
+    append("HTTP/1.1 ${out.status} ${httpStatusPhrase(out.status)}\r\n")
+    if (!hasContentTypeHeader && out.contentType != null) {
+        append("Content-Type: ${out.contentType}\r\n")
+    }
+    out.headers.forEach { (k, v) ->
+        if (!k.equals("Connection", ignoreCase = true) && !k.equals("Transfer-Encoding", ignoreCase = true)) {
+            append("$k: $v\r\n")
+        }
+    }
+    if (!hasContentLengthHeader && out.bodyBytes != null) {
+        append("Content-Length: ${out.bodyBytes.size}\r\n")
+    }
+    if (!hasCorsHeader) {
+        append("Access-Control-Allow-Origin: *\r\n")
+    }
+    append("Connection: close\r\n\r\n")
+}
+val os = sock.getOutputStream()
+os.write(headers.toByteArray())
+if (isHead) {
+                try { out.bodyStream?.close() } catch (_: Throwable) {}
+            } else if (out.bodyStream != null) {
+    out.bodyStream.use { stream ->
+        val buf = ByteArray(8192)
+        while (true) {
+            val n = stream.read(buf)
+            if (n < 0) break
+            if (n > 0) os.write(buf, 0, n)
+        }
+    }
+} else if (out.bodyBytes != null && out.bodyBytes.isNotEmpty()) {
+    os.write(out.bodyBytes)
+}
+os.flush()
+} catch (_: Throwable) {
+try { sock.close() } catch (_: Throwable) {}
+} finally {
+try { sock.close() } catch (_: Throwable) {}
         }
     }
 
     /** 调用蜘蛛的 proxy(Map)，把 Object[]{status, contentType, InputStream} 转成 HTTP 响应。 */
-    private fun invokeProxy(params: Map<String, String>): Pair<Int, ByteArray> {
-        val holder = lastClassName?.let { spiders[it] }
-            ?: return 500 to "spider not loaded".toByteArray()
-        val sp = holder.instance
-        val clazz = holder.clazz
-        // 显式标注类型，避免 try/catch 表达式被推断成公共超类型 Serializable。
-        val result: Pair<Int, ByteArray> = try {
-            val ret = clazz.getMethod("proxy", Map::class.java).invoke(sp, params)
-            val arr = ret as? Array<*> ?: return 500 to "bad proxy return".toByteArray()
-            val status = (arr.getOrNull(0) as? Number)?.toInt() ?: 200
-            val bytes = when (val body = arr.getOrNull(2)) {
-                is ByteArray -> body
-                is String -> body.toByteArray()
-                is InputStream -> readStream(body)
-                else -> byteArrayOf()
-            }
-            status to bytes
-        } catch (t: Throwable) {
-            500 to (rootCause(t).message?.toByteArray() ?: byteArrayOf())
+private class ProxyResponse(
+    val status: Int,
+    val contentType: String?,
+    val bodyBytes: ByteArray?,
+    val bodyStream: InputStream?,
+    val headers: Map<String, String>
+)
+
+private fun httpStatusPhrase(code: Int): String = when (code) {
+    200 -> "OK"
+    201 -> "Created"
+    204 -> "No Content"
+    206 -> "Partial Content"
+    301 -> "Moved Permanently"
+    302 -> "Found"
+    303 -> "See Other"
+    304 -> "Not Modified"
+    307 -> "Temporary Redirect"
+    308 -> "Permanent Redirect"
+    400 -> "Bad Request"
+    401 -> "Unauthorized"
+    403 -> "Forbidden"
+    404 -> "Not Found"
+    416 -> "Range Not Satisfiable"
+    500 -> "Internal Server Error"
+    502 -> "Bad Gateway"
+    503 -> "Service Unavailable"
+    else -> "OK"
+}
+
+private fun invokeProxy(params: Map<String, String>): ProxyResponse {
+    val holder = lastClassName?.let { spiders[it] }
+        ?: return ProxyResponse(500, "text/plain; charset=utf-8", "spider not loaded".toByteArray(), null, emptyMap())
+    val sp = holder.instance
+    val clazz = holder.clazz
+    return try {
+        fun callGlobalProxy(): Any? = try {
+            Class.forName("com.github.catvod.spider.Proxy", true, holder.loader)
+                .getMethod("proxy", Map::class.java)
+                .invoke(null, params)
+        } catch (_: ClassNotFoundException) {
+            null
+        } catch (_: NoSuchMethodException) {
+            null
         }
-        return result
+        fun callSpiderProxy(): Any? {
+            var r = try {
+                clazz.getMethod("proxy", Map::class.java).invoke(sp, params)
+            } catch (_: NoSuchMethodException) {
+                null
+            }
+            if (r == null) {
+                r = try {
+                    clazz.getMethod("proxyLocal", Map::class.java).invoke(sp, params)
+                } catch (_: NoSuchMethodException) {
+                    null
+                }
+            }
+            return r
+        }
+        val ret = if (params.containsKey("do")) {
+            callGlobalProxy() ?: callSpiderProxy()
+        } else {
+            callSpiderProxy() ?: callGlobalProxy()
+        }
+        val arr = ret as? Array<*>
+            ?: return ProxyResponse(500, "text/plain; charset=utf-8", "bad proxy return".toByteArray(), null, emptyMap())
+        val status = (arr.getOrNull(0) as? Number)?.toInt() ?: 200
+        val contentType = (arr.getOrNull(1) as? String)?.takeIf { it.isNotBlank() }
+        val headers = LinkedHashMap<String, String>()
+        val rawHeaders = arr.getOrNull(3) as? Map<*, *>
+        rawHeaders?.forEach { (k, v) ->
+            val key = k?.toString()?.trim()
+            val value = v?.toString()?.trim()
+            if (!key.isNullOrEmpty() && value != null) {
+                headers[key] = value
+            }
+        }
+        when (val body = arr.getOrNull(2)) {
+            is InputStream -> ProxyResponse(status, contentType, null, body, headers)
+            is ByteArray -> ProxyResponse(status, contentType, body, null, headers)
+            is String -> ProxyResponse(status, contentType, body.toByteArray(), null, headers)
+            else -> ProxyResponse(status, contentType, ByteArray(0), null, headers)
+        }
+    } catch (t: Throwable) {
+        ProxyResponse(500, "text/plain; charset=utf-8", (rootCause(t).message ?: "").toByteArray(), null, emptyMap())
     }
+}
 
     // ------------------------------------------------------------------
     // 加固壳初始化

@@ -42,4 +42,6 @@ class AppLog {
   static Future<void> dispose() async {}
 
   static Future<void> openDirectory() async {}
+
+  static Future<String?> exportLatestLog() async => null;
 }

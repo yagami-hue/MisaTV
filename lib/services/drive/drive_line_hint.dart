@@ -94,14 +94,16 @@ final _rules = <_HintRule>[
     RegExp(r'(^|[^0-9])189([^0-9]|$)'),
     '天翼',
   ]),
-  _HintRule('guangya', '光雅云盘', [
+  _HintRule('guangya', '光鸭云盘', [
     '光雅',
+    '光鸭',
     RegExp('guangya', caseSensitive: false),
-  ]),
-  _HintRule('thunder', '迅雷', [
+  ], supported: true, webLogin: true),
+  _HintRule('thunder', '迅雷云盘', [
     '迅雷',
     RegExp('thunder', caseSensitive: false),
-  ]),
+    RegExp('xunlei', caseSensitive: false),
+  ], supported: true, webLogin: true),
   _HintRule('pikpak', 'PikPak', [
     RegExp('pikpak', caseSensitive: false),
   ]),

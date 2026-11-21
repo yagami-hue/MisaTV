@@ -6,6 +6,8 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
+import okhttp3.Dns;
+
 /**
  * TVBox / CatVod 蜘蛛基类（Android 宿主侧实现）。
  *
@@ -92,4 +94,6 @@ public abstract class Spider {
     public Object[] proxyLocal(Map<String, String> params) {
         return null;
     }
+
+public static Dns safeDns() { return Dns.SYSTEM; }
 }

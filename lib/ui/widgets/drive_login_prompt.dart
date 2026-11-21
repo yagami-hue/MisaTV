@@ -90,8 +90,7 @@ Future<void> _showUnsupported(
       content: Text(
         [
           if (message.isNotEmpty) message,
-          '本机只内置了夸克 / UC / 百度的扫码登录，以及 115 / 哔哩的手动 Cookie；'
-          '这条线路请换其他可用线路再试。',
+          '本机已内置夸克 / UC / 百度 / 115 / 哔哩 / 迅雷 / 光鸭的登录与凭据配置；这条线路暂不支持，请换其他可用线路再试。',
         ].join('\n\n'),
       ),
       actions: [

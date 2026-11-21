@@ -1,13 +1,17 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 
 import '../../app.dart';
 import '../../core/logging/app_log.dart';
 import '../../services/drive/baidu_session.dart';
 import '../../services/drive/quark_session.dart';
+import '../../services/drive/bili_session.dart';
+import '../../services/drive/pan115_session.dart';
 import '../../services/drive/uc_session.dart';
 import 'drive_cookie_dialog.dart';
 import 'uc_tv_login_dialog.dart';
@@ -45,6 +49,7 @@ class _WebLoginConfig {
     this.loginSelectors = const [],
     this.hideSelectors = const [],
     this.extraCss = '',
+    this.useLocalStorageToken = false,
   });
 
   final String provider;
@@ -76,6 +81,7 @@ class _WebLoginConfig {
 
   /// 额外的兜底样式。
   final String extraCss;
+  final bool useLocalStorageToken;
 }
 
 const _webLoginConfigs = <String, _WebLoginConfig>{
@@ -133,6 +139,60 @@ const _webLoginConfigs = <String, _WebLoginConfig>{
       '.pass-footer',
       '.app-download',
     ],
+  ),
+  '115': _WebLoginConfig(
+  provider: '115',
+  name: '115网盘',
+  loginUrl: 'https://115.com/',
+    scope: 'https:/115.com',
+    cookieScopes: [
+      'https:/115.com',
+      'https:/webapi.115.com',
+      'https:/proapi.115.com',
+    ],
+    authCookies: ['UID', 'CID', 'SEID', 'KID'],
+    readyCookies: ['UID', 'CID', 'SEID'],
+  ),
+  'bili': _WebLoginConfig(
+    provider: 'bili',
+    name: '哔哩哔哩',
+    loginUrl: 'https:/passport.bilibili.com/login',
+    scope: 'https:/www.bilibili.com',
+    cookieScopes: [
+      'https:/www.bilibili.com',
+      'https:/passport.bilibili.com',
+      'https:/api.bilibili.com',
+    ],
+    authCookies: ['SESSDATA', 'bili_jct', 'DedeUserID'],
+    readyCookies: ['SESSDATA', 'DedeUserID'],
+  ),
+  'thunder': _WebLoginConfig(
+    provider: 'thunder',
+    name: '迅雷云盘',
+    loginUrl: 'https://pan.xunlei.com/',
+    scope: 'https://pan.xunlei.com',
+    cookieScopes: [
+      'https://pan.xunlei.com',
+      'https://xunlei.com',
+      'https://xluser-ssl.xunlei.com',
+    ],
+    authCookies: ['sessionid', 'userid', 'loginday'],
+    readyCookies: [],
+    useLocalStorageToken: true,
+  ),
+  'guangya': _WebLoginConfig(
+    provider: 'guangya',
+    name: '光鸭云盘',
+    loginUrl: 'https://www.guangyapan.com/home/',
+    scope: 'https://www.guangyapan.com',
+    cookieScopes: [
+      'https://www.guangyapan.com',
+      'https://app.guangyapan.com',
+      'https://api.guangyapan.com',
+    ],
+    authCookies: ['token', 'access_token', 'refresh_token'],
+    readyCookies: [],
+    useLocalStorageToken: true,
   ),
 };
 
@@ -254,13 +314,21 @@ class _DriveWebLoginDialogState extends State<_DriveWebLoginDialog> {
   String _lastValidatedCookie = '';
   bool? _lastValidatedOk;
   String _status = '正在打开网页…';
-  String? _error;
+  String? _guangyaDeviceCode;
+  String? _guangyaAuthUrl;
+  String? _guangyaUserCode;
+  bool _guangyaAuthLoading = false;
+  String? _guangyaError;
+    String? _error;
 
   _WebLoginConfig get _config => widget.config;
 
   @override
   void initState() {
     super.initState();
+    if (_config.provider == 'guangya') {
+      _startGuangyaDeviceAuth();
+    }
     _bootstrap();
   }
 
@@ -270,6 +338,81 @@ class _DriveWebLoginDialogState extends State<_DriveWebLoginDialog> {
     _timeoutTimer?.cancel();
     super.dispose();
   }
+  Future<void> _startGuangyaDeviceAuth() async {
+    if (_guangyaAuthLoading) return;
+    if (mounted) { setState(() { _guangyaAuthLoading = true; _guangyaError = null; }); }
+    final client = HttpClient();
+    try {
+      final req = await client.postUrl(
+        Uri.https('account.guangyapan.com', '/v1/auth/device/code'),
+      );
+      req.headers.set('content-type', 'application/json');
+      req.headers.set('referer', _config.scope);
+      req.headers.set('user-agent', _desktopUserAgent);
+      req.write(
+        jsonEncode({'scope': 'user', 'client_id': 'aMe-8VSlkrbQXpUR'}),
+      );
+      final resp = await req.close();
+      final body = await resp.transform(utf8.decoder).join();
+      if (!mounted || _finished) return;
+      if (resp.statusCode >= 200 && resp.statusCode < 300) {
+        final decoded = jsonDecode(body);
+        if (decoded is Map) {
+          final deviceCode = (decoded['device_code'] ?? '').toString().trim();
+          final userCode = (decoded['user_code'] ?? '').toString().trim();
+          final verifyComplete =
+              (decoded['verification_uri_complete'] ?? '').toString().trim();
+          final verifyUri =
+              (decoded['verification_uri'] ?? '').toString().trim();
+          final authUrl =
+              verifyComplete.isNotEmpty ? verifyComplete : verifyUri;
+          if (deviceCode.isNotEmpty && authUrl.isNotEmpty) {
+            setState(() {
+              _guangyaDeviceCode = deviceCode;
+              _guangyaUserCode = userCode.isNotEmpty ? userCode : null;
+              _guangyaAuthUrl = authUrl;
+            _guangyaAuthLoading = false;
+            if (userCode.isNotEmpty) {
+              _status = '请完成光鸭官方授权（授权码：$userCode）';
+            }
+          });
+          _timer ??= Timer.periodic(
+            const Duration(seconds: 2),
+            (_) => _poll(),
+          );
+        } else if (mounted) {
+          setState(() {
+            _guangyaError = '光鸭授权响应缺少必要字段（device_code 或 verification_uri）';
+            _guangyaAuthLoading = false;
+          });
+        }
+      } else if (mounted) {
+        setState(() {
+          _guangyaError = '获取光鸭授权码失败：响应格式异常';
+          _guangyaAuthLoading = false;
+        });
+      }
+    } else if (mounted) {
+      setState(() {
+        _guangyaError = '获取光鸭授权码失败（HTTP ${resp.statusCode}）';
+        _guangyaAuthLoading = false;
+      });
+    }
+  } catch (e) {
+    if (mounted) {
+      setState(() {
+        _guangyaError = '获取光鸭授权码失败：$e';
+        _guangyaAuthLoading = false;
+      });
+    }
+  } finally {
+    client.close();
+    if (mounted && _guangyaAuthLoading) {
+      setState(() => _guangyaAuthLoading = false);
+    }
+    }
+  }
+
 
   Future<void> _bootstrap() async {
     _timer = Timer.periodic(const Duration(milliseconds: 1500), (_) => _poll());
@@ -356,6 +499,91 @@ class _DriveWebLoginDialogState extends State<_DriveWebLoginDialog> {
     if (_polling || _finished || _expired) return;
     _polling = true;
     try {
+      if (_config.provider == 'guangya' &&
+          (_guangyaDeviceCode ?? '').isNotEmpty) {
+        final client = HttpClient();
+        try {
+          final req = await client.postUrl(
+            Uri.https('account.guangyapan.com', '/v1/auth/token'),
+          );
+          req.headers.set('content-type', 'application/json');
+          req.headers.set('referer', _config.scope);
+          req.headers.set('user-agent', _desktopUserAgent);
+          req.write(
+            jsonEncode({
+              'grant_type': 'urn:ietf:params:oauth:grant-type:device_code',
+              'device_code': _guangyaDeviceCode,
+              'client_id': 'aMe-8VSlkrbQXpUR',
+            }),
+          );
+          final resp = await req.close();
+          final body = await resp.transform(utf8.decoder).join();
+          if (!mounted || _finished) return;
+          if (resp.statusCode >= 200 && resp.statusCode < 300) {
+            final m = jsonDecode(body);
+            if (m is Map) {
+              final accessToken = m['access_token'];
+              if (accessToken is String && accessToken.isNotEmpty) {
+                final tokenJson = jsonEncode({
+                  'token_type': (m['token_type'] ?? 'Bearer').toString(),
+                  'access_token': accessToken,
+                  'refresh_token': (m['refresh_token'] ?? '').toString(),
+                  'sub': (m['sub'] ?? '').toString(),
+                });
+                _finished = true;
+                _timer?.cancel();
+                _timeoutTimer?.cancel();
+                if (!mounted) return;
+                final app = AppScope.of(context);
+                await app.saveDriveAccount('guangya', tokenJson);
+                if (!mounted) return;
+                Navigator.of(context).pop(true);
+                return;
+              }
+            }
+          }
+        } catch (_) {
+          // Ignore transient errors and fall through to localStorage scan.
+        } finally {
+          client.close();
+        }
+      }
+      if (_config.useLocalStorageToken && _controller != null) {
+        final lsRaw = await _controller!.evaluateJavascript(
+          source: '''
+            (function() {
+              try {
+                var fallback = '';
+                for (var i = 0; i < localStorage.length; i++) {
+                  var k = localStorage.key(i);
+                  if (!k) continue;
+                  if (k.indexOf('credentials_') === 0 || k === 'token' || k === 'auth_token') {
+                    var raw = localStorage.getItem(k);
+                    if (!raw) continue; try { var o = JSON.parse(raw); if (o && typeof o === 'object') { var at = o.access_token || o.accessToken || ''; var rt = o.refresh_token || o.refreshToken || ''; if ((typeof at === 'string' && at.length >= 10) || (typeof rt === 'string' && rt.length >= 10)) { return JSON.stringify({token_type: o.token_type || o.tokenType || 'Bearer', access_token: o.access_token || o.accessToken || '', refresh_token: o.refresh_token || o.refreshToken || ''}); } } } catch (e) { if (!fallback && raw.length >= 20) fallback = raw; }
+                  }
+                }
+                return fallback || null;
+              } catch (e) {
+                return null;
+              }
+            })();
+          ''',
+        );
+        if (lsRaw is String && lsRaw.isNotEmpty) {
+          final String? token = lsRaw.trim().isEmpty ? null : lsRaw.trim();
+          if (token != null && token.isNotEmpty) {
+            _finished = true;
+            _timer?.cancel();
+            _timeoutTimer?.cancel();
+            if (!mounted) return;
+            final app = AppScope.of(context);
+            await app.saveDriveAccount(_config.provider, token);
+            if (!mounted) return;
+            Navigator.of(context).pop(true);
+            return;
+          }
+        }
+      }
       final cookies = await _readCookies();
       if (!_isLoggedIn(cookies)) {
         _loginSeenAt = 0;
@@ -377,7 +605,9 @@ class _DriveWebLoginDialogState extends State<_DriveWebLoginDialog> {
       // 用 `/member`（百度 `/api/gettemplatevariable`）探测真实登录态。
       if ((_config.provider == 'quark' ||
               _config.provider == 'uc' ||
-              _config.provider == 'baidu') &&
+              _config.provider == 'baidu' ||
+            _config.provider == '115' ||
+            _config.provider == 'bili') &&
           cookie != _lastValidatedCookie &&
           now - _lastValidateAt >= 3000) {
         _lastValidatedCookie = cookie;
@@ -385,7 +615,9 @@ class _DriveWebLoginDialogState extends State<_DriveWebLoginDialog> {
         final session = switch (_config.provider) {
           'quark' => await refreshQuarkSession(cookie),
           'uc' => await refreshUcSession(cookie),
-          _ => await refreshBaiduSession(cookie),
+          '115' => await refreshPan115Session(cookie),
+          'bili' => await refreshBiliSession(cookie),
+            _ => await refreshBaiduSession(cookie),
         };
         if (!mounted) return;
         _lastValidatedOk = session.valid;
@@ -412,7 +644,9 @@ class _DriveWebLoginDialogState extends State<_DriveWebLoginDialog> {
       }
       if (_config.provider == 'quark' ||
           _config.provider == 'uc' ||
-          _config.provider == 'baidu') {
+          _config.provider == 'baidu' ||
+         _config.provider == '115' ||
+        _config.provider == 'bili') {
         // Cookie 刚变化但还没到下一次校验时间：继续等，绝不能先保存访客 Cookie。
         if (cookie != _lastValidatedCookie) return;
         if (_lastValidatedOk == false) {
@@ -489,6 +723,128 @@ class _DriveWebLoginDialogState extends State<_DriveWebLoginDialog> {
     Navigator.of(context).pop(true);
   }
 
+  Widget _buildGuangyaQrBody(BuildContext context) {
+    final theme = Theme.of(context);
+    if (_guangyaAuthLoading) {
+      return Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const CircularProgressIndicator(),
+            const SizedBox(height: 16),
+            Text(
+              '正在获取光鸭登录二维码...',
+              style: theme.textTheme.bodyMedium,
+            ),
+          ],
+        ),
+      );
+    }
+    if (_guangyaError != null || (_guangyaAuthUrl ?? '').isEmpty) {
+      return Center(
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(
+                Icons.error_outline_rounded,
+                size: 40,
+                color: theme.colorScheme.error,
+              ),
+              const SizedBox(height: 12),
+              Text(
+                _guangyaError ?? '未能获取光鸭登录二维码',
+                textAlign: TextAlign.center,
+                style: theme.textTheme.bodyMedium,
+              ),
+              const SizedBox(height: 16),
+              FilledButton.icon(
+                onPressed: _startGuangyaDeviceAuth,
+                icon: const Icon(Icons.refresh_rounded),
+                label: const Text('重新获取二维码'),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
+    final qrUrl = Uri.https(
+      'api.qrserver.com',
+      '/v1/create-qr-code/',
+      {
+        'size': '280x280',
+        'margin': '12',
+        'data': _guangyaAuthUrl!,
+      },
+    ).toString();
+
+    return Center(
+      child: SingleChildScrollView(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: Colors.white,
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: Image.network(
+                qrUrl,
+                width: 220,
+                height: 220,
+                fit: BoxFit.contain,
+              ),
+            ),
+            if ((_guangyaUserCode ?? '').isNotEmpty) ...[
+              const SizedBox(height: 16),
+              SelectableText(
+                '授权码：$_guangyaUserCode',
+                style: theme.textTheme.titleMedium?.copyWith(
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+            ],
+            const SizedBox(height: 12),
+            Text(
+              '请使用「光鸭云盘 App」扫码确认登录\n（同一台手机可先截屏，再在光鸭 App 扫一扫 → 相册选择截屏）',
+              textAlign: TextAlign.center,
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
+            ),
+            const SizedBox(height: 20),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                OutlinedButton.icon(
+                  onPressed: () {
+                    Clipboard.setData(ClipboardData(text: _guangyaAuthUrl!));
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(content: Text('已复制光鸭授权链接')),
+                    );
+                  },
+                  icon: const Icon(Icons.copy_rounded, size: 18),
+                  label: const Text('复制授权链接'),
+                ),
+                const SizedBox(width: 12),
+                FilledButton.tonalIcon(
+                  onPressed: _startGuangyaDeviceAuth,
+                  icon: const Icon(Icons.refresh_rounded, size: 18),
+                  label: const Text('刷新二维码'),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
@@ -531,7 +887,9 @@ class _DriveWebLoginDialogState extends State<_DriveWebLoginDialog> {
                         ),
                         const SizedBox(height: 2),
                         Text(
-                          _config.hint,
+                        (_guangyaUserCode ?? '').isNotEmpty
+                            ? '请完成光鸭官方授权（授权码：$_guangyaUserCode）'
+                            :                           _config.hint,
                           style: theme.textTheme.labelSmall?.copyWith(
                             color: theme.colorScheme.onSurface.withValues(
                               alpha: 0.55,
@@ -551,17 +909,24 @@ class _DriveWebLoginDialogState extends State<_DriveWebLoginDialog> {
             ),
             const Divider(height: 1),
             Expanded(
-              child: Stack(
+              child: _config.provider == 'guangya'
+                  ? _buildGuangyaQrBody(context)
+                  : Stack(
                 children: [
                   Positioned.fill(
                     child: InAppWebView(
                       initialUrlRequest: URLRequest(
-                        url: WebUri(_config.loginUrl),
+                        url: WebUri(_guangyaAuthUrl ?? _config.loginUrl),
                       ),
                       initialSettings: InAppWebViewSettings(
                         javaScriptEnabled: true,
                         supportMultipleWindows: false,
                         userAgent: _desktopUserAgent,
+                        useWideViewPort: true,
+                        loadWithOverviewMode: true,
+                        supportZoom: true,
+                        builtInZoomControls: true,
+                        displayZoomControls: false,
                       ),
                       onWebViewCreated: (controller) =>
                           _controller = controller,

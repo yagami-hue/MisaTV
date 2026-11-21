@@ -1,6 +1,7 @@
 /// 网盘手动 Cookie 输入的清洗与校验（纯函数，便于测试）。
 library;
 
+import 'dart:convert';
 /// 各网盘视为「登录态」的 Cookie 名；命中任意一个即可。
 const Map<String, List<String>> driveAuthCookieNames = {
   'quark': ['__puus', '__pus', '__puuk', '__pusd'],
@@ -19,6 +20,8 @@ const Map<String, String> driveCookieDomains = {
   'baidu': 'pan.baidu.com',
   '115': '115.com',
   'bili': 'bilibili.com',
+  'thunder': 'pan.xunlei.com',
+  'guangya': 'guangyapan.com',
 };
 
 /// 除登录态字段外还必须齐全的 Cookie（缺了会被服务端判成半个会话）。
@@ -28,9 +31,45 @@ const Map<String, String> driveCookieDomains = {
 const Map<String, List<String>> driveRequiredCookieNames = {
   '115': ['UID', 'CID', 'SEID'],
 };
+bool isTokenDriveProvider(String provider) =>
+    provider == 'thunder' || provider == 'guangya';
+
+String normalizeDriveTokenInput(String raw) {
+  var value = raw.trim();
+  if ((value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))) {
+    if (value.length >= 2) {
+      value = value.substring(1, value.length - 1).trim();
+    }
+  }
+  if (value.toLowerCase().startsWith('bearer ')) {
+    value = value.substring(7).trim();
+  }
+  if (value.startsWith('{') && value.endsWith('}')) {
+    try {
+      final decoded = jsonDecode(value);
+      if (decoded is Map) {
+        final candidates = [
+          decoded['refresh_token'],
+          decoded['refreshToken'],
+          decoded['access_token'],
+          decoded['accessToken'],
+          decoded['token'],
+        ];
+        for (final c in candidates) {
+          if (c is String && c.trim().isNotEmpty) {
+            return c.trim();
+          }
+        }
+      }
+    } catch (_) {}
+  }
+  return value;
+}
 
 /// 该 Cookie 是否已具备完整会话（登录态字段 + 必需字段）。
 bool driveCookieIsComplete(String provider, String cookie) {
+  if (isTokenDriveProvider(provider)) return cookie.trim().isNotEmpty;
   if (!driveCookieHasAuth(provider, cookie)) return false;
   final required = driveRequiredCookieNames[provider] ?? const [];
   if (required.isEmpty) return true;
@@ -100,6 +139,7 @@ Set<String> driveCookieNames(String cookie) {
 
 /// 是否包含该网盘的登录态字段（只做粗筛，最终以在线校验为准）。
 bool driveCookieHasAuth(String provider, String cookie) {
+  if (isTokenDriveProvider(provider)) return cookie.trim().isNotEmpty;
   final required = driveAuthCookieNames[provider] ?? const [];
   if (required.isEmpty) return cookie.trim().isNotEmpty;
   final names = driveCookieNames(cookie);
@@ -108,6 +148,7 @@ bool driveCookieHasAuth(String provider, String cookie) {
 
 /// 缺少登录态字段时给用户看的提示。
 String driveCookieMissingHint(String provider) {
+  if (isTokenDriveProvider(provider)) return 'Token 为空';
   final names = driveAuthCookieNames[provider] ?? const [];
   if (names.isEmpty) return 'Cookie 为空';
   final required = driveRequiredCookieNames[provider] ?? const [];

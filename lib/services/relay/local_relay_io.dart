@@ -403,7 +403,8 @@ class LocalRelay {
       // 封面 / 海报会在浏览时反复回源，连接池多留一会儿：
       // 默认 15 秒空闲就断开，翻两页再回来又要重做一次 TLS 握手。
       ..idleTimeout = const Duration(seconds: 60)
-      ..autoUncompress = false;
+      ..autoUncompress = false
+      ..findProxy = _findProxyDirectLoopback;
 
     HttpServer server;
     try {
@@ -725,6 +726,10 @@ class LocalRelay {
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
             'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
       }
+    }
+    final m1905Link = targetHost == 'm1905.com' || targetHost.endsWith('.m1905.com');
+    if (m1905Link && _headerValue(headers, HttpHeaders.refererHeader).isEmpty) {
+      headers[HttpHeaders.refererHeader] = 'https://www.1905.com/';
     }
     final davId = (query['dav'] ?? '').trim();
     if (davId.isNotEmpty &&
@@ -1834,8 +1839,13 @@ class LocalRelay {
   }) async {
     final res = request.response;
     final rawQuery = request.uri.query;
+    final reqPath = request.uri.path;
+    final targetPath = reqPath.startsWith('/proxy/') &&
+            int.tryParse(reqPath.substring('/proxy/'.length)) == null
+        ? reqPath
+        : '/proxy';
     final target =
-        'http://127.0.0.1:$port/proxy'
+        'http://127.0.0.1:$port$targetPath'
         '${rawQuery.isEmpty ? '' : '?$rawQuery'}';
     final headers = <String, String>{};
     for (final name in const [
@@ -1860,10 +1870,41 @@ class LocalRelay {
       AppLog.w('relay', '转发取流 JVM 失败：$e');
       return false;
     }
-    if (!acceptErrorStatus && upstream.statusCode >= 400) {
-      await upstream.drain<void>().catchError((Object _) {});
-      AppLog.w('relay', '取流 JVM 未能处理该路由（HTTP ${upstream.statusCode}）');
-      return false;
+    List<int>? bufferedPlainM3u8;
+    if (!acceptErrorStatus) {
+      final ct = (upstream.headers.value(HttpHeaders.contentTypeHeader) ?? '')
+          .toLowerCase();
+      final isPlainText =
+          ct.contains('text/plain') &&
+          !ct.contains('mpegurl') &&
+          !ct.contains('m3u8');
+      final isNonMediaText =
+          (ct.contains('text/html') || ct.contains('application/json')) &&
+          !ct.contains('mpegurl') &&
+          !ct.contains('m3u8');
+      if (upstream.statusCode >= 400 ||
+          (request.method != 'HEAD' && upstream.contentLength == 0) ||
+          isNonMediaText) {
+        await upstream.drain<void>().catchError((Object _) {});
+        AppLog.w(
+          'relay',
+          '取流 JVM 返回无效媒体响应（HTTP ${upstream.statusCode}, ct=$ct, len=${upstream.contentLength}）',
+        );
+        return false;
+      }
+      if (isPlainText && request.method != 'HEAD') {
+        final bytes = await _readLimited(upstream);
+        final head = utf8.decode(bytes.take(64).toList(), allowMalformed: true).trimLeft();
+        if (head.startsWith('#EXTM3U')) {
+          bufferedPlainM3u8 = bytes;
+        } else {
+          AppLog.w(
+            'relay',
+            '取流 JVM 返回无效 text/plain 响应（HTTP ${upstream.statusCode}, len=${bytes.length}）',
+          );
+          return false;
+        }
+      }
     }
     res.statusCode = upstream.statusCode;
     _copyHeader(upstream, res, HttpHeaders.contentTypeHeader);
@@ -1872,6 +1913,12 @@ class LocalRelay {
     _copyHeader(upstream, res, HttpHeaders.contentRangeHeader);
     _copyHeader(upstream, res, HttpHeaders.contentEncodingHeader);
     if (request.method == 'HEAD') {
+      await res.close();
+      return true;
+    }
+    if (bufferedPlainM3u8 != null) {
+      res.headers.contentLength = bufferedPlainM3u8.length;
+      res.add(bufferedPlainM3u8);
       await res.close();
       return true;
     }
@@ -2347,7 +2394,8 @@ class LocalRelay {
         client ??
         (_client ??= HttpClient()
           ..connectionTimeout = const Duration(seconds: 15)
-          ..autoUncompress = false);
+          ..autoUncompress = false
+          ..findProxy = _findProxyDirectLoopback);
 
     Future<({HttpClientResponse response, String finalUrl})> send(
       HttpClient targetClient,
@@ -2370,6 +2418,7 @@ class LocalRelay {
       final insecure = _insecureClient ??= HttpClient()
         ..connectionTimeout = const Duration(seconds: 15)
         ..autoUncompress = false
+        ..findProxy = _findProxyDirectLoopback
         ..badCertificateCallback = (_, _, _) => true;
       return await send(insecure);
     }
@@ -2432,6 +2481,12 @@ class LocalRelay {
   /// initialize 超时都没触发过，就是这个原因。
   ///
   /// 取 12 秒：正常 CDN 首字节 < 1s；慢节点偶发 3-5s；超过 12s 基本可以判死。
+  static String _findProxyDirectLoopback(Uri uri) {
+    final h = uri.host.toLowerCase();
+    if (h == '127.0.0.1' || h == 'localhost' || h == '::1') return 'DIRECT';
+    return HttpClient.findProxyFromEnvironment(uri);
+  }
+
   static const _headerTimeout = Duration(seconds: 12);
 
   /// 关闭请求并等响应头；超时/失败都 abort 掉这条连接，避免句柄泄漏。

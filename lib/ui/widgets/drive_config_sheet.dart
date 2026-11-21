@@ -73,7 +73,7 @@ class DriveConfigPanel extends StatefulWidget {
 
 class _DriveConfigPanelState extends State<DriveConfigPanel> {
   /// 面板里列出的凭据：能扫码的三家 + 只能手动粘贴的 115 / 哔哩。
-  static const _providers = ['quark', 'uc', 'baidu', '115', 'bili'];
+  static const _providers = ['quark', 'uc', 'baidu', '115', 'bili', 'thunder', 'guangya'];
 
   String get _actionText {
     final item = widget.item;

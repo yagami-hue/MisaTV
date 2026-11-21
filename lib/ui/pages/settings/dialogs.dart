@@ -668,7 +668,7 @@ String _driveAccountsSubtitle(AppState app) {
           entry.value,
     ];
     return stale.isEmpty
-        ? '未登录 · 点击扫码或粘贴 Cookie 配置夸克 / UC / 百度 / 115 / 哔哩'
+        ? '未登录 · 点击扫码或粘贴 Cookie/Token 配置夸克 / UC / 百度 / 115 / 哔哩 / 迅雷 / 光鸭'
         : '${stale.join(' / ')} 登录已失效，点击重新配置';
   }
   final usernames = [
